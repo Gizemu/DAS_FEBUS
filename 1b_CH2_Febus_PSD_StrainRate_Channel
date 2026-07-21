@@ -1,0 +1,294 @@
+#Author: Gizem Karslioglu
+#Febus DAS PSD in Strain Rate for a single user defined channel
+#Reads Febus A1R HDF5 files with structure device/Source1/Zone1/Strain Rate [nStrain|s] ChX
+#Each raw file holds 60 blocks of 1050 samples at 1000 Hz for 366 channels
+#The 5 percent block overlap is trimmed so only the central 1000 samples of each block are kept
+#The Welch estimate is left in the native strain rate units of the instrument
+#Strain rate PSD emphasizes high frequency content because differentiation multiplies amplitude by 2 pi f
+#One PSD curve is drawn per file, colored by file start time, plus the mean PSD in red
+#The plot is pinned to the actual data extent so there is no gap between the y axis and the data
+#Processing results are cached to npz so replotting does not reread the raw h5 files
+#Output files are numbered incrementally 0001, 0002 and so on
+
+import os
+import re
+import time
+import glob
+import datetime
+
+import numpy as np
+import h5py
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import matplotlib.colors as mcolors
+
+from scipy.signal import welch, detrend
+
+
+#terminal progress helper, prints elapsed seconds with every message and flushes immediately
+START_CLOCK = time.time()
+def progress(msg):
+    print(f"[{time.time() - START_CLOCK:7.1f} s] {msg}", flush=True)
+
+#user settings, edit only this block
+DATA_FOLDER      = r"/Volumes/X9 Pro/Febus_May_Night/Febus_May13_0600_1200"
+CABLE            = "CH2"                    #fiber cable id, CH1 or CH2, used to match file names and dataset name
+SELECTED_CHANNEL = 80                       #channel index along the fiber to analyse
+START_TIME       = "2026-05-13 06:00:00"    #UTC start of the analysis window, set to None to use all files
+END_TIME         = "2026-05-13 12:00:00"    #UTC end of the analysis window, set to None to use all files
+FREQ_MIN         = 0.03                     #Hz, lower limit of the PSD plot
+FREQ_MAX         = 500.0                    #Hz, upper limit of the PSD plot
+PSD_NPERSEG      = 4096                     #Welch segment length in samples, acts as a floor, raised for low FREQ_MIN
+PSD_OVERLAP_FRAC = 0.5                      #Welch overlap fraction
+LOG_FREQ_AXIS    = True                     #True for log frequency axis, False for linear
+UNIT_SCALE       = 1.0e-9                   #nanostrain per second to strain per second
+PLOT_MAX_POINTS  = 3000                     #frequency points per curve after log binned averaging
+USE_CACHE        = True                     #True loads a matching npz cache instead of rereading raw data
+OUTPUT_FOLDER    = None                     #None creates a folder named after this script
+FIGURE_DPI       = 640
+JPEG_QUALITY     = 92
+#end of user settings
+
+def find_zone(f):
+    #locate the Zone group anywhere inside the Febus file
+    found = [None]
+    def visit(name, obj):
+        if found[0] is None and isinstance(obj, h5py.Group) and re.search(r"Zone\d+$", name):
+            found[0] = obj
+    f.visititems(visit)
+    return found[0]
+
+def find_strain_dataset(zone, cable):
+    #pick the strain rate dataset, prefer the one matching the cable id
+    keys = [k for k in zone.keys() if "strain" in k.lower()]
+    for k in keys:
+        if cable.lower() in k.lower():
+            return zone[k]
+    return zone[keys[0]] if keys else None
+
+def find_time_array(f):
+    #locate the per block posix time stamps
+    found = [None]
+    def visit(name, obj):
+        if found[0] is None and isinstance(obj, h5py.Dataset) and name.endswith("time"):
+            found[0] = obj[:]
+    f.visititems(visit)
+    return found[0]
+
+def parse_timestamp(filename):
+    #parse the UTC start time encoded in the Febus file name
+    m = re.search(r"(\d{4}\.\d{2}\.\d{2}|\d{4}\W\d{2}\W\d{2})[_\s](\d{2})\W(\d{2})\W(\d{2})_UTC", filename)
+    if m:
+        date = re.sub(r"\W", " ", m.group(1))
+        y, mo, d = date.split()
+        try:
+            return datetime.datetime(int(y), int(mo), int(d), int(m.group(2)), int(m.group(3)), int(m.group(4)))
+        except ValueError:
+            return None
+    return None
+
+def load_channel(path, cable, channel):
+    #read one channel from one file and return the trimmed continuous signal in nanostrain per second
+    with h5py.File(path, "r") as f:
+        zone = find_zone(f)
+        ds = find_strain_dataset(zone, cable)
+        n_blocks, spb, n_ch = ds.shape
+        if channel >= n_ch:
+            raise ValueError(f"channel {channel} out of range, file has {n_ch} channels")
+        overlap_pct = float(np.asarray(zone.attrs.get("BlockOverlap", [0])).flat[0])
+        usable = int(round(spb / (1.0 + overlap_pct / 100.0)))
+        trim = (spb - usable) // 2
+        raw = ds[:, :, channel].astype(np.float64)
+        if trim > 0:
+            raw = raw[:, trim:spb - trim]
+        sig = raw.reshape(-1)
+        spacing = np.asarray(zone.attrs.get("Spacing", [1.0, 1.0, 1.0])).flat
+        dt_ms = float(spacing[1])
+        fs = 1000.0 / dt_ms
+        dx = float(spacing[0])
+        t = find_time_array(f)
+        t0 = float(t[0]) - 0.5 * usable / fs if t is not None else None
+    return sig, fs, dx, t0
+
+def find_h5_files(data_folder, cable):
+    #locate Febus h5 files for one cable, searching data_folder and every subfolder
+    if not os.path.isdir(data_folder):
+        raise SystemExit(f"DATA_FOLDER does not exist or is not mounted: {data_folder}")
+    all_h5 = sorted(glob.glob(os.path.join(data_folder, "**", "*.h5"), recursive=True))
+    cable_low = cable.lower()
+    matched = [p for p in all_h5 if cable_low in os.path.basename(p).lower()]
+    if not matched:
+        progress(f"no files matched cable {cable} under {data_folder}")
+        if all_h5:
+            progress(f"{len(all_h5)} h5 files were found but none contained '{cable}' in the name")
+        else:
+            progress("no h5 files were found at all, check that the drive is mounted and DATA_FOLDER is correct")
+        raise SystemExit(f"no h5 files for cable {cable} in {data_folder}")
+    return matched
+
+def next_output_index(folder, prefix):
+    #find the next incremental four digit index for output files sharing a prefix
+    pattern = re.compile(re.escape(prefix) + r"_(\d{4})\.")
+    highest = 0
+    if os.path.isdir(folder):
+        for name in os.listdir(folder):
+            m = pattern.search(name)
+            if m:
+                highest = max(highest, int(m.group(1)))
+    return highest + 1
+
+def condense_spectra(freqs, psd, max_points):
+    #average power inside log spaced frequency bins so figures with many files draw quickly
+    if len(freqs) <= max_points:
+        return freqs, psd
+    fpos = freqs[freqs > 0]
+    edges = np.geomspace(fpos[0], fpos[-1], max_points + 1)
+    idx = np.clip(np.searchsorted(edges, freqs, side="right") - 1, 0, max_points - 1)
+    cnt = np.bincount(idx, minlength=max_points)
+    fsum = np.bincount(idx, weights=freqs, minlength=max_points)
+    psum = np.vstack([np.bincount(idx, weights=row, minlength=max_points) for row in psd])
+    keep = cnt > 0
+    return fsum[keep] / cnt[keep], psum[:, keep] / cnt[keep]
+
+def main():
+    progress(f"starting {os.path.basename(__file__)}")
+    progress(f"settings cable {CABLE}, channel {SELECTED_CHANNEL}, window {START_TIME} to {END_TIME}, band {FREQ_MIN} to {FREQ_MAX} Hz")
+    script_name = os.path.splitext(os.path.basename(__file__))[0]
+    out_dir = OUTPUT_FOLDER or os.path.join(DATA_FOLDER, script_name)
+    os.makedirs(out_dir, exist_ok=True)
+    cache_dir = os.path.join(out_dir, "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    progress(f"output folder {out_dir}")
+
+    files = find_h5_files(DATA_FOLDER, CABLE)
+    progress(f"found {len(files)} h5 files for cable {CABLE}")
+
+    t_start = datetime.datetime.strptime(START_TIME, "%Y-%m-%d %H:%M:%S") if START_TIME else None
+    t_end   = datetime.datetime.strptime(END_TIME,   "%Y-%m-%d %H:%M:%S") if END_TIME else None
+    selected = []
+    for fp in files:
+        ts = parse_timestamp(os.path.basename(fp))
+        if ts is None:
+            selected.append((fp, None))
+            continue
+        if t_start and ts < t_start:
+            continue
+        if t_end and ts > t_end:
+            continue
+        selected.append((fp, ts))
+    if not selected:
+        raise SystemExit("no files inside the requested time window")
+    progress(f"{len(selected)} files fall inside the requested time window")
+
+    psd_list = []
+    time_list = []
+    freqs = None
+    fs = None
+    dx = None
+    nseg_used = None
+    loaded_from_cache = False
+
+    tag = (f"psdrate_{CABLE}_ch{SELECTED_CHANNEL}_{len(selected)}files_fmin{FREQ_MIN}_fmax{FREQ_MAX}"
+           f"_n{PSD_NPERSEG}_ov{PSD_OVERLAP_FRAC}")
+    cache_file = os.path.join(cache_dir, tag + ".npz")
+    if USE_CACHE and os.path.isfile(cache_file):
+        progress(f"loading cache {os.path.basename(cache_file)}")
+        cz = np.load(cache_file)
+        freqs = cz["freqs"]
+        fs = float(cz["fs"]); dx = float(cz["dx"])
+        psd_list = list(cz["psd"])
+        time_list = [datetime.datetime.fromtimestamp(t, tz=datetime.timezone.utc).replace(tzinfo=None) for t in cz["tposix"]]
+        selected = []
+        loaded_from_cache = True
+
+    for idx, (fp, ts) in enumerate(selected, 1):
+        progress(f"[{idx}/{len(selected)}] loading {os.path.basename(fp)}")
+        try:
+            sig, fs, dx, t0 = load_channel(fp, CABLE, SELECTED_CHANNEL)
+        except Exception as e:
+            progress(f"skipping {os.path.basename(fp)}: {e}")
+            continue
+
+        if nseg_used is None:
+            needed = int(np.ceil(fs / FREQ_MIN)) if FREQ_MIN > 0 else PSD_NPERSEG
+            nseg_used = min(len(sig), max(PSD_NPERSEG, needed))
+            if nseg_used > PSD_NPERSEG:
+                progress(f"raising segment length from {PSD_NPERSEG} to {nseg_used} samples to resolve {FREQ_MIN} Hz")
+            progress(f"lowest resolvable frequency is {fs / nseg_used:.4f} Hz")
+
+        sig = detrend(sig) * UNIT_SCALE
+        nseg = min(nseg_used, len(sig))
+        f_w, p_rate = welch(sig, fs=fs, nperseg=nseg,
+                            noverlap=int(nseg * PSD_OVERLAP_FRAC), window="hann")
+        freqs = f_w
+        psd_list.append(p_rate)
+        time_list.append(ts if ts is not None else datetime.datetime.fromtimestamp(t0, tz=datetime.timezone.utc).replace(tzinfo=None))
+
+    if not psd_list:
+        raise SystemExit("no PSD could be computed")
+
+    psd_rate = np.vstack(psd_list)
+    if not loaded_from_cache:
+        progress(f"saving cache {os.path.basename(cache_file)}")
+        np.savez_compressed(cache_file, freqs=freqs, psd=psd_rate,
+                            tposix=np.array([t.timestamp() for t in time_list]),
+                            fs=fs, dx=dx)
+    progress(f"computed {len(psd_list)} strain rate PSD curves, building the figure")
+
+    #keep the strain rate PSD in its native units, no integration is applied
+    band = (freqs >= FREQ_MIN) & (freqs <= FREQ_MAX)
+    fb = freqs[band]
+    psd_rate_b = psd_rate[:, band]
+    fb, psd_rate_b = condense_spectra(fb, psd_rate_b, PLOT_MAX_POINTS)
+    progress(f"drawing {psd_rate_b.shape[0]} curves with {len(fb)} points each")
+
+    psd_db = 10.0 * np.log10(np.maximum(psd_rate_b, 1e-300))
+    mean_db = 10.0 * np.log10(np.maximum(np.nanmean(psd_rate_b, axis=0), 1e-300))
+
+    #color each curve by its file start time
+    tnum = np.array([t.timestamp() for t in time_list])
+    norm = mcolors.Normalize(vmin=tnum.min(), vmax=tnum.max() if tnum.max() > tnum.min() else tnum.min() + 1)
+    cmap = plt.get_cmap("viridis")
+
+    position_m = SELECTED_CHANNEL * dx
+    fig, ax = plt.subplots(figsize=(14, 8))
+    for i in range(psd_db.shape[0]):
+        ax.plot(fb, psd_db[i], lw=0.5, alpha=0.6, color=cmap(norm(tnum[i])))
+    ax.plot(fb, mean_db, color="red", lw=2.2, label=f"Mean PSD  (n={len(psd_list)} files)")
+
+    if LOG_FREQ_AXIS:
+        ax.set_xscale("log")
+    #pin the x axis to the actual data extent so the first curve sits flush against the y axis
+    ax.set_xlim(fb[0], fb[-1])
+    ax.margins(x=0)
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("PSD (dB re 1 (strain/s)$^2$/Hz)")
+    tmin = min(time_list).strftime("%Y-%m-%d %H:%M:%S")
+    tmax = max(time_list).strftime("%Y-%m-%d %H:%M:%S")
+    ax.set_title(f"Strain Rate PSD  Cable {CABLE}  Channel {SELECTED_CHANNEL} "
+                 f"(Optical Position: {position_m:.1f} m)\n{tmin} UTC to {tmax} UTC")
+    ax.grid(True, which="both", ls=":", alpha=0.5)
+    ax.legend(loc="upper right")
+
+    sm = cm.ScalarMappable(norm=norm, cmap=cmap)
+    cbar = fig.colorbar(sm, ax=ax, pad=0.01)
+    ticks = np.linspace(tnum.min(), tnum.max(), 6) if tnum.max() > tnum.min() else [tnum.min()]
+    cbar.set_ticks(ticks)
+    cbar.set_ticklabels([datetime.datetime.fromtimestamp(t, tz=datetime.timezone.utc).strftime("%H:%M") for t in ticks])
+    cbar.set_label("File start time (UTC)")
+
+    fig.tight_layout()
+    base = f"PSD_StrainRate_{CABLE}_Ch{SELECTED_CHANNEL}_Pos{position_m:.0f}m"
+    seq = next_output_index(out_dir, base)
+    out_name = os.path.join(out_dir, f"{base}_{seq:04d}.jpeg")
+    progress("saving the figure to disk")
+    fig.savefig(out_name, dpi=FIGURE_DPI, pil_kwargs={"quality": JPEG_QUALITY})
+    plt.close(fig)
+    progress(f"saved {out_name}")
+    progress("finished")
+
+if __name__ == "__main__":
+    main()
