@@ -1,0 +1,440 @@
+#Author: Gizem Karslioglu
+#Febus DAS Probabilistic Power Spectral Density PPSD for all h5 files of one cable
+#The PPSD is a 2D histogram of many Welch PSD estimates, following the McNamara and Buland method
+#Each file is cut into overlapping segments, one PSD per segment, then all PSDs are binned
+#The plot shows the probability of observing a given PSD level at each frequency
+#Percentile curves P5 P50 P95 are overlaid and also exported to CSV
+#Units are strain rate, converted from nanostrain per second to strain per second
+
+import os
+import re
+import time
+import glob
+import csv
+import datetime
+
+import numpy as np
+import h5py
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+
+from scipy.signal import welch, detrend
+from scipy.ndimage import gaussian_filter
+
+
+#terminal progress helper, prints elapsed seconds with every message and flushes immediately
+START_CLOCK = time.time()
+def progress(msg):
+    print(f"[{time.time() - START_CLOCK:7.1f} s] {msg}", flush=True)
+
+#user settings, edit only this block
+DATA_FOLDER       = r"/Volumes/X9 Pro/Febus_May_Night/Febus_May15_0600_1200"
+CABLE             = "CH1"                   #fiber cable id, CH1 or CH2
+SELECTED_CHANNEL  = 80                      #channel index along the fiber
+START_TIME        = None                    #UTC "YYYY-MM-DD HH:MM:SS" or None for all files
+END_TIME          = None                    #UTC "YYYY-MM-DD HH:MM:SS" or None for all files
+FREQ_MIN          = 0.01                    #Hz, lower plot limit
+FREQ_MAX          = 500.0                   #Hz, upper plot limit
+SEGMENT_SEC       = 100.0                    #segment length in seconds for each PSD estimate
+SEGMENT_OVERLAP   = 0.5                     #overlap fraction between consecutive segments
+PSD_NPERSEG       = 4096                    #Welch sub segment length in samples
+DB_MIN            = None                    #dB axis minimum, None derives it from the data so bins are never empty
+DB_MAX            = None                    #dB axis maximum, None derives it from the data
+DB_BIN            = 1.0                     #dB bin width of the histogram
+SMOOTH_SIGMA      = 1.0                     #Gaussian smoothing of the displayed histogram, 0 disables
+UNIT_SCALE        = 1.0e-9                  #nanostrain per second to strain per second
+USE_CACHE         = True                    #True reuses merged-signal and PSD npz files when available
+OUTPUT_FOLDER     = None                                      #None creates a folder named after this script
+FIGURE_DPI        = 4096
+JPEG_QUALITY      = 92
+#end of user settings
+
+def find_zone(f):
+    #locate the Zone group anywhere inside the Febus file
+    found = [None]
+    def visit(name, obj):
+        if found[0] is None and isinstance(obj, h5py.Group) and re.search(r"Zone\d+$", name):
+            found[0] = obj
+    f.visititems(visit)
+    return found[0]
+
+def find_strain_dataset(zone, cable):
+    #pick the strain rate dataset, prefer the one matching the cable id
+    keys = [k for k in zone.keys() if "strain" in k.lower()]
+    for k in keys:
+        if cable.lower() in k.lower():
+            return zone[k]
+    return zone[keys[0]] if keys else None
+
+def find_time_array(f):
+    #locate the per block posix time stamps
+    found = [None]
+    def visit(name, obj):
+        if found[0] is None and isinstance(obj, h5py.Dataset) and name.endswith("time"):
+            found[0] = obj[:]
+    f.visititems(visit)
+    return found[0]
+
+def parse_timestamp(filename):
+    #parse the UTC start time encoded in the Febus file name
+    m = re.search(r"(\d{4})\W(\d{2})\W(\d{2})[_\s](\d{2})\W(\d{2})\W(\d{2})_UTC", filename)
+    if m:
+        g = [int(x) for x in m.groups()]
+        try:
+            return datetime.datetime(*g)
+        except ValueError:
+            return None
+    return None
+
+def load_channel(path, cable, channel):
+    #read one channel from one file and return the trimmed continuous signal in nanostrain per second
+    with h5py.File(path, "r") as f:
+        zone = find_zone(f)
+        ds = find_strain_dataset(zone, cable)
+        n_blocks, spb, n_ch = ds.shape
+        if channel >= n_ch:
+            raise ValueError(f"channel {channel} out of range, file has {n_ch} channels")
+        overlap_pct = float(np.asarray(zone.attrs.get("BlockOverlap", [0])).flat[0])
+        usable = int(round(spb / (1.0 + overlap_pct / 100.0)))
+        trim = (spb - usable) // 2
+        raw = ds[:, :, channel].astype(np.float64)
+        if trim > 0:
+            raw = raw[:, trim:spb - trim]
+        sig = raw.reshape(-1)
+        spacing = np.asarray(zone.attrs.get("Spacing", [1.0, 1.0, 1.0])).flat
+        fs = 1000.0 / float(spacing[1])
+        dx = float(spacing[0])
+    return sig, fs, dx
+
+def pqlx_colormap():
+    #build a PQLX style colormap, white at zero probability then blue to red
+    colors = [(1, 1, 1), (0.2, 0.2, 0.9), (0.1, 0.7, 0.9), (0.1, 0.9, 0.3),
+              (0.9, 0.9, 0.1), (1.0, 0.5, 0.0), (0.9, 0.05, 0.05)]
+    return mcolors.LinearSegmentedColormap.from_list("pqlx", colors, N=256)
+
+def find_h5_files(data_folder, cable):
+    #locate Febus h5 files for one cable, searching data_folder and every subfolder
+    #the cable id match is case insensitive so CH1, ch1, Ch1 all work
+    if not os.path.isdir(data_folder):
+        raise SystemExit(f"DATA_FOLDER does not exist or is not mounted: {data_folder}")
+    all_h5 = sorted(glob.glob(os.path.join(data_folder, "**", "*.h5"), recursive=True))
+    cable_low = cable.lower()
+    matched = [p for p in all_h5 if cable_low in os.path.basename(p).lower()]
+    if not matched:
+        #give a clear diagnostic instead of a bare error
+        progress(f"no files matched cable {cable} under {data_folder}")
+        if all_h5:
+            progress(f"{len(all_h5)} h5 files were found but none contained '{cable}' in the name, first few are:")
+            for p in all_h5[:5]:
+                progress(f"    {os.path.relpath(p, data_folder)}")
+            progress("check the CABLE setting or the file naming")
+        else:
+            progress("no h5 files were found at all, check that the drive is mounted and DATA_FOLDER is correct")
+            subs = [d for d in glob.glob(os.path.join(data_folder, "*")) if os.path.isdir(d)]
+            if subs:
+                progress("subfolders present are:")
+                for d in subs[:10]:
+                    progress(f"    {os.path.basename(d)}/")
+        raise SystemExit(f"no h5 files for cable {cable} in {data_folder}")
+    return matched
+
+def next_output_index(folder, prefix):
+    #find the next incremental four digit index for output files sharing a prefix
+    pattern = re.compile(re.escape(prefix) + r"_(\d{4})\.")
+    highest = 0
+    if os.path.isdir(folder):
+        for name in os.listdir(folder):
+            m = pattern.search(name)
+            if m:
+                highest = max(highest, int(m.group(1)))
+    return highest + 1
+
+def main():
+    progress(f"starting {os.path.basename(__file__)}")
+    progress(
+        f"settings cable {CABLE}, channel {SELECTED_CHANNEL}, "
+        f"segment {SEGMENT_SEC} s, band {FREQ_MIN} to {FREQ_MAX} Hz"
+    )
+
+    script_name = os.path.splitext(os.path.basename(__file__))[0]
+    out_dir = OUTPUT_FOLDER or os.path.join(DATA_FOLDER, script_name)
+    os.makedirs(out_dir, exist_ok=True)
+    cache_dir = os.path.join(out_dir, "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    progress(f"output folder {out_dir}")
+
+    files = find_h5_files(DATA_FOLDER, CABLE)
+    progress(f"found {len(files)} h5 files for cable {CABLE}")
+
+    t_start = datetime.datetime.strptime(START_TIME, "%Y-%m-%d %H:%M:%S") if START_TIME else None
+    t_end = datetime.datetime.strptime(END_TIME, "%Y-%m-%d %H:%M:%S") if END_TIME else None
+
+    # Keep only files whose filename timestamp falls inside the requested interval.
+    selected_files = []
+    for fp in files:
+        ts = parse_timestamp(os.path.basename(fp))
+        if ts is not None:
+            if t_start and ts < t_start:
+                continue
+            if t_end and ts > t_end:
+                continue
+        selected_files.append(fp)
+
+    if not selected_files:
+        raise SystemExit("no HDF5 files remain after applying the time selection")
+
+    # This NPZ contains the complete continuous channel signal assembled from all files.
+    merge_tag = (
+        f"merged_signal_{CABLE}_ch{SELECTED_CHANNEL}_{len(selected_files)}files_"
+        f"start{START_TIME or 'all'}_end{END_TIME or 'all'}"
+    )
+    merge_tag = re.sub(r"[^A-Za-z0-9_.-]+", "-", merge_tag)
+    merged_file = os.path.join(cache_dir, merge_tag + ".npz")
+
+    signal_all = None
+    fs = None
+    dx = None
+    ts_first = None
+    ts_last = None
+    n_used_files = 0
+
+    if USE_CACHE and os.path.isfile(merged_file):
+        progress(f"loading merged signal {os.path.basename(merged_file)}")
+        mz = np.load(merged_file, allow_pickle=True)
+        signal_all = mz["signal"].astype(np.float64, copy=False)
+        fs = float(mz["fs"])
+        dx = float(mz["dx"])
+        n_used_files = int(mz["n_used_files"])
+        ts_first = mz["ts_first"].item()
+        ts_last = mz["ts_last"].item()
+    else:
+        signal_parts = []
+        expected_fs = None
+        expected_dx = None
+
+        for idx, fp in enumerate(selected_files, 1):
+            progress(f"[{idx}/{len(selected_files)}] reading {os.path.basename(fp)}")
+            try:
+                sig, fs_i, dx_i = load_channel(fp, CABLE, SELECTED_CHANNEL)
+            except Exception as e:
+                progress(f"skipping {os.path.basename(fp)}: {e}")
+                continue
+
+            if expected_fs is None:
+                expected_fs = fs_i
+                expected_dx = dx_i
+            else:
+                if not np.isclose(fs_i, expected_fs, rtol=0, atol=1e-9):
+                    raise SystemExit(
+                        f"sampling rate changed between files: {expected_fs} Hz and {fs_i} Hz"
+                    )
+                if not np.isclose(dx_i, expected_dx, rtol=0, atol=1e-9):
+                    raise SystemExit(
+                        f"spatial spacing changed between files: {expected_dx} m and {dx_i} m"
+                    )
+
+            signal_parts.append(sig)
+            n_used_files += 1
+
+            ts = parse_timestamp(os.path.basename(fp))
+            if ts is not None:
+                ts_first = ts if ts_first is None or ts < ts_first else ts_first
+                ts_last = ts if ts_last is None or ts > ts_last else ts_last
+
+        if not signal_parts:
+            raise SystemExit("no channel data could be read from the selected HDF5 files")
+
+        fs = float(expected_fs)
+        dx = float(expected_dx)
+        total_samples = sum(part.size for part in signal_parts)
+        progress(
+            f"concatenating {n_used_files} files into one signal: "
+            f"{total_samples} samples, {total_samples / fs:.1f} s"
+        )
+        signal_all = np.concatenate(signal_parts).astype(np.float64, copy=False)
+        del signal_parts
+
+        progress(f"saving merged signal to {os.path.basename(merged_file)}")
+        # np.savez is used instead of np.savez_compressed because compression can be very slow
+        # for a long floating-point time series. The resulting file is still a standard NPZ.
+        np.savez(
+            merged_file,
+            signal=signal_all,
+            fs=np.array(fs),
+            dx=np.array(dx),
+            n_used_files=np.array(n_used_files),
+            ts_first=np.array(ts_first, dtype=object),
+            ts_last=np.array(ts_last, dtype=object),
+        )
+
+    duration_sec = signal_all.size / fs
+    progress(
+        f"merged signal ready: {signal_all.size} samples, "
+        f"{duration_sec:.1f} s ({duration_sec / 3600.0:.2f} h)"
+    )
+
+    seg_len = int(round(SEGMENT_SEC * fs))
+    if seg_len <= 0:
+        raise SystemExit("SEGMENT_SEC must produce at least one sample")
+    if signal_all.size < seg_len:
+        raise SystemExit(
+            f"merged signal is only {duration_sec:.1f} s, shorter than "
+            f"the requested {SEGMENT_SEC:.1f} s segment"
+        )
+
+    hop = max(1, int(round(seg_len * (1.0 - SEGMENT_OVERLAP))))
+    n_segments_expected = 1 + (signal_all.size - seg_len) // hop
+    progress(
+        f"creating {SEGMENT_SEC:g} s segments with "
+        f"{SEGMENT_OVERLAP * 100:.0f}% overlap: {n_segments_expected} segments"
+    )
+
+    psd_tag = (
+        f"ppsd_merged_{CABLE}_ch{SELECTED_CHANNEL}_{n_used_files}files_"
+        f"seg{SEGMENT_SEC}_ov{SEGMENT_OVERLAP}_n{PSD_NPERSEG}_"
+        f"fmin{FREQ_MIN}_fmax{FREQ_MAX}_scale{UNIT_SCALE}"
+    )
+    psd_cache_file = os.path.join(cache_dir, psd_tag + ".npz")
+
+    if USE_CACHE and os.path.isfile(psd_cache_file):
+        progress(f"loading PSD cache {os.path.basename(psd_cache_file)}")
+        pz = np.load(psd_cache_file, allow_pickle=True)
+        freqs = pz["freqs"]
+        psd_db = pz["psd_db"]
+    else:
+        all_psd_db = []
+        freqs = None
+
+        needed = int(np.ceil(fs / FREQ_MIN)) if FREQ_MIN > 0 else PSD_NPERSEG
+        welch_nperseg = min(seg_len, max(PSD_NPERSEG, needed))
+        progress(
+            f"Welch nperseg {welch_nperseg} samples; "
+            f"frequency spacing {fs / welch_nperseg:.6g} Hz"
+        )
+
+        for k, i0 in enumerate(range(0, signal_all.size - seg_len + 1, hop), 1):
+            if k == 1 or k % 100 == 0 or k == n_segments_expected:
+                progress(f"PSD segment {k}/{n_segments_expected}")
+            seg = detrend(signal_all[i0:i0 + seg_len]) * UNIT_SCALE
+            f_w, p_w = welch(
+                seg,
+                fs=fs,
+                nperseg=welch_nperseg,
+                noverlap=welch_nperseg // 2,
+                window="hann",
+            )
+            freqs = f_w
+            all_psd_db.append(10.0 * np.log10(np.maximum(p_w, 1e-300)))
+
+        if not all_psd_db:
+            raise SystemExit("no PSD segments were computed")
+
+        psd_db = np.vstack(all_psd_db)
+        progress(f"saving PSD cache {os.path.basename(psd_cache_file)}")
+        np.savez_compressed(
+            psd_cache_file,
+            freqs=freqs,
+            psd_db=psd_db,
+            dx=np.array(dx),
+            n_used_files=np.array(n_used_files),
+            ts_first=np.array(ts_first, dtype=object),
+            ts_last=np.array(ts_last, dtype=object),
+        )
+
+    progress(f"{n_used_files} files used, {psd_db.shape[0]} PSD segments collected")
+    progress("building the probability histogram")
+
+    band = (freqs >= FREQ_MIN) & (freqs <= FREQ_MAX)
+    fb = freqs[band]
+    psd_db = psd_db[:, band]
+    if fb.size == 0:
+        raise SystemExit(
+            f"no Welch frequency bins fall inside {FREQ_MIN} to {FREQ_MAX} Hz"
+        )
+
+    progress(
+        f"requested minimum frequency {FREQ_MIN:g} Hz; "
+        f"first available Welch bin {fb[0]:.6g} Hz"
+    )
+
+    db_lo = DB_MIN if DB_MIN is not None else np.floor(np.percentile(psd_db, 0.2)) - 40.0
+    db_hi = DB_MAX if DB_MAX is not None else np.ceil(np.percentile(psd_db, 99.8)) + 40.0
+    progress(f"histogram dB range {db_lo:.0f} to {db_hi:.0f}")
+
+    db_edges = np.arange(db_lo, db_hi + DB_BIN, DB_BIN)
+    db_centers = 0.5 * (db_edges[:-1] + db_edges[1:])
+    hist = np.zeros((len(db_centers), len(fb)))
+    for j in range(len(fb)):
+        h, _ = np.histogram(psd_db[:, j], bins=db_edges)
+        hist[:, j] = h
+    hist = 100.0 * hist / psd_db.shape[0]
+    if SMOOTH_SIGMA > 0:
+        hist = gaussian_filter(hist, sigma=SMOOTH_SIGMA)
+
+    p5 = np.percentile(psd_db, 5, axis=0)
+    p50 = np.percentile(psd_db, 50, axis=0)
+    p95 = np.percentile(psd_db, 95, axis=0)
+
+    position_m = SELECTED_CHANNEL * dx
+    span = ""
+    if ts_first and ts_last:
+        span = f"{ts_first:%Y-%m-%d %H:%M} UTC  to  {ts_last:%Y-%m-%d %H:%M} UTC  |  "
+
+    fig, ax = plt.subplots(figsize=(13, 8))
+    mesh = ax.pcolormesh(
+        fb,
+        db_centers,
+        hist,
+        cmap=pqlx_colormap(),
+        shading="auto",
+        vmin=0,
+        vmax=max(1.0, hist.max()),
+    )
+    ax.plot(fb, p5, color="gray", lw=1.0)
+    ax.plot(fb, p50, color="gray", lw=1.4)
+    ax.plot(fb, p95, color="gray", lw=1.0)
+    label_idx = min(3, len(fb) - 1)
+    ax.text(fb[label_idx], p5[label_idx], "P5", color="gray", fontsize=10, va="top")
+    ax.text(fb[label_idx], p50[label_idx], "P50", color="gray", fontsize=10, va="bottom")
+    ax.text(fb[label_idx], p95[label_idx], "P95", color="gray", fontsize=10, va="bottom")
+
+    ax.set_xscale("log")
+    ax.set_xlim(float(fb[0]), min(FREQ_MAX, float(fb[-1])))
+    ax.set_ylim(db_lo, db_hi)
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("PSD (dB re 1 (strain/s)$^2$/Hz)")
+    ax.set_title(
+        f"Strain Rate PPSD  Cable {CABLE}  Ch {SELECTED_CHANNEL}  "
+        f"({position_m:.0f} m)  |  {psd_db.shape[0]} segments\n"
+        f"{span}data range: [{psd_db.min():.0f}, {psd_db.max():.0f}] dB"
+    )
+    ax.grid(True, which="both", ls=":", alpha=0.4)
+    cbar = fig.colorbar(mesh, ax=ax, pad=0.01)
+    cbar.set_label("Probability (%)")
+
+    fig.tight_layout()
+    base = f"PPSD_StrainRate_{CABLE}_Ch{SELECTED_CHANNEL}_Pos{position_m:.0f}m"
+    seq = next_output_index(out_dir, base)
+    out_name = os.path.join(out_dir, f"{base}_{seq:04d}.jpeg")
+    progress("saving the figure to disk")
+    fig.savefig(out_name, dpi=FIGURE_DPI, pil_kwargs={"quality": JPEG_QUALITY})
+    plt.close(fig)
+    progress(f"saved {out_name}")
+
+    csv_base = f"PPSD_Percentiles_{CABLE}_Ch{SELECTED_CHANNEL}"
+    csv_seq = next_output_index(out_dir, csv_base)
+    csv_name = os.path.join(out_dir, f"{csv_base}_{csv_seq:04d}.csv")
+    with open(csv_name, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["frequency_hz", "P5_db", "P50_db", "P95_db"])
+        for j in range(len(fb)):
+            w.writerow([f"{fb[j]:.4f}", f"{p5[j]:.2f}", f"{p50[j]:.2f}", f"{p95[j]:.2f}"])
+    progress(f"saved {csv_name}")
+    progress("finished")
+
+
+if __name__ == "__main__":
+    main()
