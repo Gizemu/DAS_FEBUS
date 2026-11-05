@@ -1,0 +1,956 @@
+
+import os
+import re
+import gc
+import glob
+import json
+import time
+import hashlib
+import datetime
+import argparse
+
+os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
+
+import numpy as np
+import h5py
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.colors import Normalize
+from scipy.signal import butter, sosfiltfilt, detrend
+
+#===================================== user settings =====================================
+DATA_FOLDER   = r"/Volumes/X9ProII/CH1"
+RECURSIVE     = False
+CABLE         = "CH1"
+OUTPUT_FOLDER = r"/Volumes/X9ProII/CH1/waterfall"
+CACHE_FOLDER  = r"/Volumes/X9ProII/CH1/waterfall/cache"
+
+#time ranges (UTC): (start, end, name), "YYYY-MM-DD HH:MM" or "YYYY-MM-DD HH:MM:SS"
+WINDOWS = [
+    ("2025-07-18 17:15", "2025-07-18 18:30", "window_1700_1305"),
+]
+
+#space: by distance (m, same stretch as the Sintela figure) or by channel; distances win when not None
+DIST_START_M     = 64.0                 #None = use CH_START_PLOT
+DIST_END_M       = 900.0                #None = use CH_END_PLOT (CH1 fibre end is ~885 m)
+CH_START_PLOT    = 1
+CH_END_PLOT      = 730                 #None = last channel
+SELECTED_DIST_M  = 475.0                #trace channel by optical distance (475 m -> Ch 396 at 1.2 m), None = SELECTED_CHANNEL
+SELECTED_CHANNEL = 396                   #only used when SELECTED_DIST_M is None
+
+#frequency
+APPLY_BANDPASS   = True                 #False = the raw strain rate exactly as stored (no filter, no detrend)
+F_LOW            = 10.0                 #Hz, None = low pass only
+F_HIGH           = 50.0                 #Hz, None = high pass only
+FILTER_ORDER     = 4
+FS_EFF           = 200.0                #Hz, rate of the plotted trace (>= 2.5 x F_HIGH is kept automatically);
+                                        #with APPLY_BANDPASS = False every raw sample is kept (fs_eff = fs)
+
+#colour scale and clipping (strain rate, nstrain/s)
+CMAP             = "RdBu_r"
+VMAX             = None                 #colour limit in nstrain/s, None = automatic (VMAX_SIGMA x noise)
+VMAX_SIGMA       = 3.0                  #automatic VMAX = VMAX_SIGMA x median channel noise (only when VMAX is None)
+SPIKE_CLIP       = None                 #hard clip of the waterfall values in nstrain/s, None = off
+PER_CH_MAD_CLIP  = True                 #clip every channel at MAD_MULT x its MAD (removes isolated spikes)
+MAD_MULT         = 15.0
+
+#signal panel
+SIGNAL_YLIM      = None                #amplitude limit of the trace panel in nstrain/s, None = automatic
+
+#figure
+MAX_PLOT_TIME_ROWS     = 20000          #waterfall rows (time), the window is subsampled to this
+TIME_TICK_INTERVAL_MIN = 30             #clock ticks every N minutes, None = automatic
+CH_TICKS               = 10             #number of channel ticks
+DPI_SAVE               = 640
+FIG_WIDTH              = 26
+FIG_HEIGHT             = 11
+JPEG_QUALITY           = 95
+
+#processing
+USE_CACHE        = True                 #False = always read the h5 files again
+SHORT_GAP_SEC    = 30.0                 #gaps up to this long are mirror-filled before the filter
+COMMON_MODE      = False                #True subtracts the median over channels at every sample
+CHUNK_SEC        = 20.0                 #streaming chunk
+CHANNEL_BLOCK    = 1024                 #channels read at a time
+DISTANCE_OFFSET_M = 0.0                 #optical distance of channel 0
+
+#metadata (the gauge length is only shown in the title)
+GAUGE_LENGTH_M     = None               #[m] None = from the file metadata
+GAUGE_LENGTH_KEY   = None               #exact "object@attribute" holding the gauge length
+DERIVATION_TIME_MS = None
+#=================================== end of user settings ===================================
+UTC = datetime.timezone.utc
+
+
+class StopRun(Exception):
+    """a clean stop, the message is printed without a traceback"""
+
+
+def to_posix(dt):
+    return dt.replace(tzinfo=UTC).timestamp()
+
+
+def from_posix(t):
+    return datetime.datetime.fromtimestamp(float(t), tz=UTC).replace(tzinfo=None)
+
+
+def parse_user_time(txt, is_end=False):
+    if txt is None:
+        return None
+    txt = str(txt).strip().replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.datetime.strptime(txt, fmt)
+        except ValueError:
+            continue
+        if fmt == "%Y-%m-%d" and is_end:
+            dt += datetime.timedelta(days=1)
+        return dt
+    raise StopRun(f"cannot read the time '{txt}', use YYYY-MM-DD HH:MM:SS")
+
+
+def open_h5(path, retries=3):
+    last = None
+    for k in range(retries):
+        try:
+            try:
+                return h5py.File(path, "r", locking=False)
+            except TypeError:
+                return h5py.File(path, "r")
+        except OSError as e:
+            last = e
+            if "signature" in str(e).lower() or "truncated" in str(e).lower():
+                break
+            time.sleep(0.5 * (k + 1))
+    raise OSError(f"cannot open HDF5 file {os.path.basename(path)} ({last})")
+
+
+def find_zone(f):
+    found = [None]
+
+    def visit(name, obj):
+        if found[0] is None and isinstance(obj, h5py.Group) and re.search(r"Zone\d+$", name):
+            found[0] = obj
+    f.visititems(visit)
+    return found[0]
+
+
+def find_strain_dataset(zone, cable):
+    keys = [k for k in zone.keys() if isinstance(zone[k], h5py.Dataset) and zone[k].ndim == 3]
+    strain = [k for k in keys if "strain" in k.lower()] or keys
+    for k in strain:
+        if cable and str(cable).lower() in k.lower():
+            return zone[k]
+    return zone[strain[0]] if strain else None
+
+
+def find_time_array(f):
+    found = [None]
+
+    def visit(name, obj):
+        if found[0] is None and isinstance(obj, h5py.Dataset) and name.lower().endswith("time"):
+            found[0] = obj[:]
+    f.visititems(visit)
+    return found[0]
+
+
+_LEN_UNITS = {"m": 1.0, "meter": 1.0, "meters": 1.0, "metre": 1.0, "metres": 1.0, "km": 1e3, "cm": 1e-2,
+              "mm": 1e-3, "ft": 0.3048, "feet": 0.3048, "foot": 0.3048, "us_survey_ft": 0.3048006}
+_TIME_UNITS = {"s": 1.0, "sec": 1.0, "second": 1.0, "seconds": 1.0, "ms": 1e-3, "msec": 1e-3,
+               "millisecond": 1e-3, "milliseconds": 1e-3, "us": 1e-6, "\u00b5s": 1e-6, "microsecond": 1e-6,
+               "ns": 1e-9}
+META_PATTERNS = {
+    "gauge_length": r"(gauge|gage)[ _-]?len(gth)?([ _-]?(m|meters?|metres?))?|gl([ _-]?(m|meters?|metres?))?",
+    "derivation_time": r"deriv(ation)?[ _-]?time([ _-]?ms)?",
+}
+
+
+def h5_attr_table(h5):
+    rows = [("/", k, v) for k, v in h5.attrs.items()]
+
+    def visit(name, obj):
+        for k, v in obj.attrs.items():
+            rows.append(("/" + name, k, v))
+        if isinstance(obj, h5py.Dataset) and obj.size <= 4 and obj.dtype.kind in "fiuSO":
+            try:
+                rows.append(("/" + name.rsplit("/", 1)[0] if "/" in name else "/", name.rsplit("/", 1)[-1], obj[()]))
+            except Exception:                                    # noqa: BLE001
+                pass
+    h5.visititems(visit)
+    return rows
+
+
+def _text(v):
+    if isinstance(v, bytes):
+        return v.decode("utf-8", errors="ignore")
+    if isinstance(v, np.ndarray) and v.dtype.kind in "SO" and v.size:
+        return _text(np.ravel(v)[0])
+    return v if isinstance(v, str) else None
+
+
+def meta_number(v):
+    t = _text(v)
+    if t is not None:
+        m = re.match(r"\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*([A-Za-z\u00b5_/|]*)", t)
+        return (float(m.group(1)), (m.group(2) or None)) if m else (None, None)
+    try:
+        a = np.ravel(np.asarray(v, dtype=float))
+        return (float(a[0]), None) if a.size else (None, None)
+    except (TypeError, ValueError):
+        return None, None
+
+
+def meta_lookup(table, name, exact=None, prefer=()):
+    if exact:
+        obj, _, key = str(exact).rpartition("@")
+        hits = [r for r in table if r[1] == key and (not obj or r[0].strip("/") == obj.strip("/"))]
+    else:
+        rx = re.compile(META_PATTERNS[name], re.I)
+        hits = [r for r in table if rx.fullmatch(str(r[1]).strip())]
+        hits.sort(key=lambda r: (not any(p.lower() in r[0].lower() for p in prefer), len(r[0])))
+    for obj, key, val in hits:
+        num, unit = meta_number(val)
+        txt = _text(val)
+        if num is None and txt is None:
+            continue
+        if unit is None:
+            for o2, k2, v2 in table:
+                if o2 == obj and str(k2).lower() in (f"{key}unit".lower(), f"{key}units".lower(),
+                                                      f"{key}_unit".lower(), f"{key}_units".lower()):
+                    unit = _text(v2) or unit
+        return dict(value=num, unit=unit, text=txt, src=f"{obj}@{key}")
+    return None
+
+
+def meta_length_m(hit, what):
+    if hit is None or hit["value"] is None:
+        return None, None
+    u = (hit["unit"] or "m").strip().lower()
+    f = _LEN_UNITS.get(u)
+    note = hit["src"] + (f" [{hit['unit']}]" if hit["unit"] else "")
+    if f is None:
+        print(f"  ! unknown length unit {hit['unit']!r} for {what} at {hit['src']}, metres assumed")
+        f = 1.0
+    return hit["value"] * f, note
+
+
+def meta_time_s(hit, default_unit):
+    if hit is None or hit["value"] is None:
+        return None, None
+    u = (hit["unit"] or default_unit).strip().lower()
+    return hit["value"] * _TIME_UNITS.get(u, _TIME_UNITS[default_unit]), hit["src"] + f" [{u}]"
+
+
+def parse_raw_unit(text):
+    if not text:
+        return None, None
+    t = str(text).lower().replace(" ", "")
+    if "rad" in t:
+        return "phase", 1.0
+    if "strain" not in t and "\u03b5" not in t and not t.startswith(("ne", "ue", "\u00b5e")):
+        return None, None
+    rate = any(s in t for s in ("/s", "|s", "rate", "pers", "/sec", "s-1", "s^-1"))
+    scale = 1.0
+    for pre, s in (("nano", 1e-9), ("nstrain", 1e-9), ("n\u03b5", 1e-9), ("ne", 1e-9), ("micro", 1e-6),
+                   ("ustrain", 1e-6), ("\u00b5strain", 1e-6), ("\u00b5\u03b5", 1e-6), ("pico", 1e-12),
+                   ("pstrain", 1e-12), ("milli", 1e-3)):
+        if t.startswith(pre) or f"[{pre}" in t or f"({pre}" in t:
+            scale = s
+            break
+    return ("strain_rate" if rate else "strain"), scale
+
+
+def parse_timestamp(filename):
+    m = re.search(r"(\d{4})\W(\d{2})\W(\d{2})[_\s](\d{2})\W(\d{2})\W(\d{2})_UTC", filename)
+    if not m:
+        return None
+    try:
+        return datetime.datetime(*[int(x) for x in m.groups()])
+    except ValueError:
+        return None
+
+
+def file_layout(f, cable):
+    zone = find_zone(f)
+    if zone is None:
+        raise ValueError(f"no Zone group, top level groups {list(f.keys())}")
+    ds = find_strain_dataset(zone, cable)
+    if ds is None:
+        raise ValueError(f"no 3-D strain rate dataset in {zone.name}, keys {list(zone.keys())}")
+    nb, spb, nch = ds.shape
+    sp = np.asarray(zone.attrs.get("Spacing", [1.0, 1.0])).ravel()
+    dx, fs = float(sp[0]), 1000.0 / float(sp[1])
+    ov = float(np.asarray(zone.attrs.get("BlockOverlap", [0])).ravel()[0])
+    usable = int(round(spb / (1.0 + ov / 100.0)))
+    trim = (spb - usable) // 2
+    table = h5_attr_table(f)
+    g, g_src = meta_length_m(meta_lookup(table, "gauge_length", exact=GAUGE_LENGTH_KEY,
+                                         prefer=("Source", "Zone")), "gauge length")
+    if GAUGE_LENGTH_M:
+        g, g_src = float(GAUGE_LENGTH_M), "setting GAUGE_LENGTH_M (override)"
+    hit = meta_lookup(table, "derivation_time", prefer=("Source", "Zone"))
+    dt_s, dt_src = meta_time_s(hit, "ms")
+    if hit is not None and hit["unit"] is None and hit["value"] is not None and hit["value"] < 0.1:
+        dt_s, dt_src = hit["value"], hit["src"] + " [s, value below 0.1]"
+    if DERIVATION_TIME_MS:
+        dt_s, dt_src = float(DERIVATION_TIME_MS) / 1000.0, "setting DERIVATION_TIME_MS (override)"
+    kind, unit_scale = parse_raw_unit(ds.name.rsplit("/", 1)[-1])
+    return ds, {"n_blocks": nb, "spb": spb, "n_ch": nch, "usable": usable, "trim": trim,
+                "n_keep": spb - 2 * trim, "dx": dx, "dx_src": f"{zone.name}@Spacing[0] [m]",
+                "fs": fs, "fs_src": f"{zone.name}@Spacing[1] [ms]", "gauge_m": g, "gauge_src": g_src,
+                "dt_s": dt_s, "dt_src": dt_src, "unit_kind": kind, "unit_scale": unit_scale,
+                "dataset": ds.name}
+
+
+def read_file(path, cable, channels):
+    #strain rate of the requested channels (Febus native nanostrain/s), float32 (samples, channels),
+    #posix time of the first sample and the layout.
+    #Each block is cut to exactly ONE block period (median spacing of the block time stamps), centred in the
+    #block, so consecutive blocks tile the time axis without holes or overlap. Dropped blocks are NaN.
+    with open_h5(path) as f:
+        ds, L = file_layout(f, cable)
+        ch = np.asarray(channels, dtype=int)
+        if ch.size == 0 or ch.min() < 0 or ch.max() >= L["n_ch"]:
+            raise ValueError(f"channels outside 0..{L['n_ch'] - 1} in {os.path.basename(path)}")
+        tb = find_time_array(f)
+        tb = None if tb is None else np.asarray(tb, dtype=np.float64).ravel()
+        nb, spb, fs = L["n_blocks"], L["spb"], L["fs"]
+        nk = L["n_keep"]
+        if tb is not None and tb.size == nb and nb > 1:
+            d = np.diff(tb)
+            d = d[d > 0]
+            if d.size:
+                step = int(round(np.median(d) * fs))
+                if 0 < step <= spb:
+                    nk = step
+        a = (spb - nk) // 2
+        b = a + nk
+        c0, c1 = int(ch.min()), int(ch.max()) + 1
+        if c1 - c0 <= 4 * len(ch):
+            raw = ds[:, a:b, c0:c1][:, :, ch - c0]
+        else:
+            raw = np.stack([ds[:, a:b, int(c)] for c in ch], axis=-1)
+        raw = raw.astype(np.float32)
+    x = raw.reshape(-1, len(ch))
+    L["dropped_sec"] = 0.0
+    if tb is not None and tb.size == nb:
+        start = tb - 0.5 * nk / fs                              #time stamps are block centres
+        t0 = float(start[0])
+        idx = np.round((start - t0) * fs).astype(np.int64)
+        if nb > 1 and np.any(np.diff(idx) <= 0):
+            print(f"  ! block times of {os.path.basename(path)} are not increasing, blocks stacked end to end")
+        elif nb > 1 and np.any(np.diff(idx) != nk):
+            x = np.full((int(idx[-1]) + nk, len(ch)), np.nan, dtype=np.float32)
+            for i, k in enumerate(idx):
+                x[k:k + nk] = raw[i]
+            L["dropped_sec"] = float(np.isnan(x[:, 0]).sum()) / fs
+    elif tb is not None and tb.size:
+        print(f"  ! {tb.size} time stamps for {nb} blocks in {os.path.basename(path)}, blocks stacked end to end")
+        t0 = float(tb[0]) - 0.5 * nk / fs
+    else:
+        ts = parse_timestamp(os.path.basename(path))
+        if ts is None:
+            raise ValueError(f"no time array and no time stamp in {os.path.basename(path)}")
+        t0 = to_posix(ts)
+    return x, t0, L
+
+
+def file_info(path, cable):
+    with open_h5(path) as f:
+        _, L = file_layout(f, cable)
+    return L
+
+
+def report_metadata(path, cable, need_gauge=False):
+    L = file_info(path, cable)
+    print(f"metadata of {os.path.basename(path)}:")
+    rows = [("gauge length", f"{L['gauge_m']:.4f} m" if L["gauge_m"] else "not found", L["gauge_src"] or "-"),
+            ("derivation time", f"{L['dt_s'] * 1e3:g} ms" if L["dt_s"] else "not found", L["dt_src"] or "-"),
+            ("channel spacing", f"{L['dx']:g} m", L["dx_src"]), ("sampling rate", f"{L['fs']:g} Hz", L["fs_src"]),
+            ("data unit", f"{L['unit_kind']} x {L['unit_scale']:g}" if L["unit_kind"] else "not recognised",
+             f"dataset name {L['dataset']}"), ("channels", str(L["n_ch"]), "data shape")]
+    for name, val, src in rows:
+        print(f"    {name:16s}: {val:22s} <- {src}")
+    if L["unit_kind"] and L["unit_kind"] != "strain_rate":
+        print(f"  ! the dataset name says {L['unit_kind']}, not strain rate: the axis labels say nstrain/s")
+    if L["gauge_m"] and not 0.5 <= L["gauge_m"] <= 500:
+        print(f"  ! gauge length {L['gauge_m']:g} m is unusual, check its unit ({L['gauge_src']})")
+    if not L["gauge_m"]:
+        with open_h5(path) as f:
+            rx = re.compile(r"gauge|gage|length|^gl", re.I)
+            cands = [f"{o}@{k} = {str(v)[:40]}" for o, k, v in h5_attr_table(f) if rx.search(str(k))][:10]
+        msg = ("no gauge length in the metadata; attributes that could hold it: " + ("; ".join(cands) or "none") +
+               ". Set GAUGE_LENGTH_KEY to the right 'object@attribute' or GAUGE_LENGTH_M to the value, "
+               "--inspect FILE lists every attribute")
+        if need_gauge:
+            raise StopRun(msg)
+        print("  ! " + msg)
+    return L
+
+
+def inspect_file(path):
+    print(f"structure of {path}  ({os.path.getsize(path) / 1e6:.1f} MB)")
+    with open_h5(path) as f:
+        def show(name, obj):
+            kind = f"dataset {name}  shape {obj.shape}  dtype {obj.dtype}" if isinstance(obj, h5py.Dataset) \
+                else f"group   {name}"
+            print("  " + kind)
+            for k, v in obj.attrs.items():
+                print(f"            attr {k} = {str(v).replace(chr(10), ' ')[:80]}")
+        f.visititems(show)
+
+
+def list_files(folder, cable, recursive):
+    pat = os.path.join(folder, "**", f"*{cable}*.h5") if recursive else os.path.join(folder, f"*{cable}*.h5")
+    files = sorted(glob.glob(pat, recursive=recursive))
+    files = [p for p in files if re.search(rf"{re.escape(cable)}(?!\d)", os.path.basename(p))]
+    files = [p for p in files if not os.path.basename(p).startswith(".") and os.path.getsize(p) >= 10000]
+    if not files:
+        raise StopRun(f"no h5 files for cable {cable} in {folder}")
+    stamped = sorted([(p, parse_timestamp(os.path.basename(p))) for p in files
+                      if parse_timestamp(os.path.basename(p)) is not None], key=lambda r: r[1])
+    if not stamped:
+        raise StopRun("no file has a readable UTC time stamp in its name")
+    gaps = np.diff([to_posix(ts) for _, ts in stamped])
+    gaps = gaps[gaps > 0]
+    file_sec = float(np.median(gaps)) if gaps.size else 60.0
+    return stamped, file_sec
+
+
+def describe_coverage(stamped, file_sec, cable):
+    first, last = stamped[0][1], stamped[-1][1] + datetime.timedelta(seconds=file_sec)
+    print(f"cable {cable}: {len(stamped)} files, nominal length {file_sec:.0f} s")
+    print(f"  coverage {first:%Y-%m-%d %H:%M:%S} to {last:%Y-%m-%d %H:%M:%S} UTC")
+    t = np.array([to_posix(ts) for _, ts in stamped])
+    big = np.where(np.diff(t) > 1.5 * file_sec)[0]
+    for i in big[:20]:
+        print(f"  gap {stamped[i][1] + datetime.timedelta(seconds=file_sec):%Y-%m-%d %H:%M:%S}"
+              f" to {stamped[i + 1][1]:%Y-%m-%d %H:%M:%S}")
+    if len(big) > 20:
+        print(f"  ... {len(big) - 20} more gaps")
+
+
+def files_between(stamped, file_sec, a, b, margin=5.0):
+    return [p for p, ts in stamped if to_posix(ts) - margin < b and to_posix(ts) + file_sec + margin > a]
+
+
+def contiguous_runs(mask):
+    if not np.any(mask):
+        return []
+    d = np.diff(np.concatenate([[0], np.asarray(mask).astype(np.int8), [0]]))
+    return list(zip(np.where(d == 1)[0], np.where(d == -1)[0]))
+
+
+def save_figure(fig, out_dir, name):
+    path = os.path.join(out_dir, name)
+    kw = {"pil_kwargs": {"quality": JPEG_QUALITY}} if name.lower().endswith((".jpg", ".jpeg")) else {}
+    fig.savefig(path, dpi=DPI_SAVE, bbox_inches="tight", facecolor="white", **kw)
+    plt.close(fig)
+    print(f"saved {path}")
+    return path
+
+
+def output_dir(sub):
+    base = OUTPUT_FOLDER or os.path.join(os.path.dirname(os.path.abspath(__file__)), "Results")
+    d = os.path.join(base, sub)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+UNIT_NAME, UNIT = "Strain rate", "n\u03b5/s"
+
+
+def design_filter(fs, band, order):
+    nyq = fs / 2.0
+    lo, hi = band
+    if hi is None or hi >= 0.99 * nyq:
+        return butter(order, lo, btype="highpass", fs=fs, output="sos") if lo else None
+    if not lo:
+        return butter(order, hi, btype="lowpass", fs=fs, output="sos")
+    return butter(order, [lo, hi], btype="bandpass", fs=fs, output="sos")
+
+
+def mirror_fill(y, bad):
+    #every run of missing samples is replaced by the data mirrored about its left edge, cross-faded
+    #(equal power, cos / sin) into the data mirrored about its right edge: continuous at both edges,
+    #same noise level as the surroundings, so the filter sees no step and nothing is drawn blank
+    n = len(y)
+    for s, e in contiguous_runs(bad):
+        g = e - s
+        i = np.arange(g)
+        left = y[np.clip(s - 1 - i, 0, n - 1)] if s > 0 else None
+        right = y[np.clip(e + g - 1 - i, 0, n - 1)] if e < n else None
+        if left is None and right is None:
+            y[s:e] = 0.0
+            continue
+        if left is None:
+            fill = right
+        elif right is None:
+            fill = left
+        else:
+            tt = (i + 0.5) / g
+            wl, wr = np.cos(0.5 * np.pi * tt)[:, None], np.sin(0.5 * np.pi * tt)[:, None]
+            fill = wl * left + wr * right
+            fill = np.where(np.isnan(fill), left, fill)
+            fill = np.where(np.isnan(fill), right, fill)
+        y[s:e] = np.nan_to_num(fill)
+    return y
+
+
+def condition(x, fs, sos):
+    #raw Febus strain rate (nstrain/s), no unit conversion and no scaling: dropped samples are mirror-filled,
+    #then, only when a filter is given, linear detrend + zero-phase band pass. The values stay in nstrain/s.
+    y = np.asarray(x, dtype=np.float64)
+    bad = np.isnan(y).any(axis=1)
+    if bad.all():
+        return np.full(y.shape, np.nan)
+    if bad.any():
+        y = mirror_fill(y, bad)
+    if sos is not None and len(y) > 6 * (2 * len(sos) + 1):
+        y = sosfiltfilt(sos, detrend(y, axis=0), axis=0)
+    if COMMON_MODE and y.shape[1] > 2:
+        y -= np.median(y, axis=1, keepdims=True)
+    return y
+
+
+def channel_list(n_ch, ch_range, step=1):
+    c0 = ch_range[0] or 0
+    c1 = n_ch - 1 if ch_range[1] is None else min(ch_range[1], n_ch - 1)
+    return list(range(c0, c1 + 1, max(1, step)))
+
+
+class FilteredStream:
+    #overlap-save streaming of the zero-phase filter, PAD samples of context on both sides; a gap up to
+    #max_gap_sec is filled (NaN here, mirror-filled by condition), a longer gap flushes and restarts
+    def __init__(self, fs, proc, chunk_sec, pad_sec, max_gap_sec=0.0):
+        self.fs, self.proc = fs, proc
+        self.chunk, self.pad = int(chunk_sec * fs), int(pad_sec * fs)
+        self.max_gap = max_gap_sec
+        self.buf, self.t0, self.head = None, None, 0
+        self.filled_sec, self.restarts = 0.0, 0
+
+    def push(self, t0, x):
+        out = []
+        if self.buf is not None:
+            end = self.t0 + len(self.buf) / self.fs
+            gap = t0 - end
+            if gap < -0.5 / self.fs:
+                if -gap >= len(x) / self.fs:
+                    return out
+                x = x[int(round(-gap * self.fs)):]
+                t0 = end
+            elif 0.5 / self.fs <= gap <= self.max_gap:
+                nfill = int(round(gap * self.fs))
+                if nfill > 0:
+                    fill = np.full((nfill, x.shape[1]), np.nan, dtype=x.dtype)
+                    x = np.concatenate([fill, x], axis=0)
+                    self.filled_sec += nfill / self.fs
+                t0 = end
+            elif gap > self.max_gap:
+                self.restarts += 1
+                out += self.flush()
+        if not len(x):
+            return out
+        if self.buf is None:
+            self.buf, self.t0, self.head = x, t0, 0
+        else:
+            self.buf = np.concatenate([self.buf, x], axis=0)
+        while len(self.buf) >= self.head + self.chunk + self.pad:
+            stop = self.head + self.chunk
+            y = self.proc(self.buf[:stop + self.pad])
+            out.append((self.t0 + self.head / self.fs, y[self.head:stop]))
+            cut = max(0, stop - self.pad)
+            self.buf, self.t0, self.head = self.buf[cut:], self.t0 + cut / self.fs, stop - cut
+        return out
+
+    def flush(self):
+        out = []
+        if self.buf is not None and len(self.buf) > self.head:
+            y = self.proc(self.buf)
+            out.append((self.t0 + self.head / self.fs, y[self.head:]))
+        self.buf, self.t0, self.head = None, None, 0
+        return out
+
+
+class PeakImage:
+    #time x channel image with ncol rows along time ("sample", "peak" or "rms" per row), the robust noise
+    #level per channel and the min / max envelope of the reference channel
+    def __init__(self, a, b, fs, nch, iref, ncol, mode="sample"):
+        self.a, self.b, self.fs = a, b, fs
+        n_samp = max(1, int(round((b - a) * fs)))
+        self.n_samp = n_samp
+        self.ncol = max(1, min(int(ncol), n_samp))
+        self.col_sec = (b - a) / self.ncol
+        self.mode = mode
+        self.kc = np.minimum(((np.arange(self.ncol) + 0.5) * n_samp / self.ncol).astype(np.int64), n_samp - 1)
+        self.img = np.full((self.ncol, nch), np.nan, dtype=np.float32)
+        self.lo = np.full(self.ncol, np.nan)
+        self.hi = np.full(self.ncol, np.nan)
+        self.med = [[] for _ in range(nch)]
+        self.iref = iref
+        if mode == "rms":
+            self.ss = np.zeros((self.ncol, nch))
+            self.nn = np.zeros((self.ncol, nch), dtype=np.float32)
+
+    def add(self, t0, y, c0):
+        k = int(round((t0 - self.a) * self.fs)) + np.arange(len(y), dtype=np.int64)
+        m = (k >= 0) & (k < self.n_samp)
+        if not m.any():
+            return
+        y, k = y[m], k[m]
+        c1 = c0 + y.shape[1]
+        cols = np.minimum(k * self.ncol // self.n_samp, self.ncol - 1)
+        ok_rows = ~np.isnan(y).all(axis=1)
+        if ok_rows.sum() > 10:
+            md = np.nanmedian(np.abs(y[ok_rows]), axis=0)
+            for j, v in enumerate(md):
+                self.med[c0 + j].append(v)
+        starts = np.concatenate([[0], np.flatnonzero(np.diff(cols)) + 1])
+        uc = cols[starts]
+        with np.errstate(invalid="ignore"):
+            mx = np.fmax.reduceat(y, starts, axis=0)
+            mn = np.fmin.reduceat(y, starts, axis=0)
+        if self.mode == "rms":
+            ok = ~np.isnan(y)
+            self.ss[uc, c0:c1] += np.add.reduceat(np.where(ok, y, 0.0).astype(np.float64) ** 2, starts, axis=0)
+            self.nn[uc, c0:c1] += np.add.reduceat(ok.astype(np.float32), starts, axis=0)
+        elif self.mode == "peak":
+            val = np.where(np.abs(np.nan_to_num(mn)) > np.abs(np.nan_to_num(mx)), mn, mx)
+            cur = self.img[uc, c0:c1]
+            take = np.isnan(cur) | (np.abs(np.nan_to_num(val)) > np.abs(np.nan_to_num(cur)))
+            self.img[uc, c0:c1] = np.where(take, val, cur)
+        else:
+            sel = k == self.kc[cols]
+            self.img[cols[sel], c0:c1] = y[sel]
+        r = self.iref - c0
+        if 0 <= r < y.shape[1]:
+            self.lo[uc] = np.fmin(self.lo[uc], mn[:, r])
+            self.hi[uc] = np.fmax(self.hi[uc], mx[:, r])
+
+    def finish(self):
+        if self.mode == "rms":
+            with np.errstate(invalid="ignore", divide="ignore"):
+                self.img = np.where(self.nn > 0, np.sqrt(self.ss / np.maximum(self.nn, 1)), np.nan).astype(np.float32)
+
+    def noise_sigma(self):
+        return np.array([1.4826 * np.median(v) if len(v) else np.nan for v in self.med])
+
+
+def fill_time_gaps(a):
+    #interpolates the missing rows of a 1-D or 2-D (time, channel) array along time, per column;
+    #edges take the nearest value, an empty column becomes 0. Returns the array and the number of filled rows
+    a = np.array(a, dtype=np.float64)
+    two_d = a.ndim == 2
+    A = a if two_d else a[:, None]
+    t = np.arange(len(A))
+    n_filled = int(np.isnan(A).all(axis=1).sum())
+    for j in range(A.shape[1]):
+        ok = np.isfinite(A[:, j])
+        if ok.all():
+            continue
+        A[:, j] = np.interp(t, t[ok], A[ok, j]) if ok.any() else 0.0
+    return (A if two_d else A[:, 0]), n_filled
+
+
+def nice_limit(v):
+    #rounds a colour limit up to 1, 1.5, 2, 2.5, 3, 4, 5, 6, 8 x 10^n for clean colour bar ticks
+    if not np.isfinite(v) or v <= 0:
+        return 1.0
+    e = 10.0 ** np.floor(np.log10(v))
+    for m in (1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10):
+        if m * e >= v * 0.999:
+            return m * e
+    return 10 * e
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def parse_window_time(txt):
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.datetime.strptime(str(txt).strip().replace("T", " "), fmt)
+        except ValueError:
+            continue
+    raise StopRun(f"cannot read the time '{txt}', use YYYY-MM-DD HH:MM")
+
+
+def select_channels(L):
+    #plotted channels and the selected channel, from distances when given, else from channel numbers
+    n_ch, dx = L["n_ch"], L["dx"]
+    for nm, v in (("CH_START_PLOT", CH_START_PLOT), ("CH_END_PLOT", CH_END_PLOT),
+                  ("SELECTED_CHANNEL", SELECTED_CHANNEL), ("DIST_START_M", DIST_START_M),
+                  ("DIST_END_M", DIST_END_M), ("SELECTED_DIST_M", SELECTED_DIST_M)):
+        if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float, np.integer, np.floating))):
+            raise StopRun(f"{nm} = {v!r} is not a number or None")
+    last_d = DISTANCE_OFFSET_M + (n_ch - 1) * dx
+    if DIST_START_M is not None:
+        c0 = int(np.ceil((DIST_START_M - DISTANCE_OFFSET_M) / dx))
+    else:
+        c0 = int(CH_START_PLOT or 0)
+    if DIST_END_M is not None:
+        c1 = int(np.floor((DIST_END_M - DISTANCE_OFFSET_M) / dx))
+    else:
+        c1 = n_ch - 1 if CH_END_PLOT is None else int(CH_END_PLOT)
+    if c1 > n_ch - 1:
+        log(f"  ! the range is cut at the last channel of the files, Ch {n_ch - 1} ({last_d:.0f} m)")
+    c0, c1 = max(0, c0), min(n_ch - 1, c1)
+    if c1 <= c0:
+        raise StopRun(f"empty channel range {c0}-{c1} (the files have channels 0-{n_ch - 1}, dx {dx:g} m)")
+    if SELECTED_DIST_M is not None:
+        ref = int(round((SELECTED_DIST_M - DISTANCE_OFFSET_M) / dx))
+        log(f"  selected distance {SELECTED_DIST_M:g} m -> Ch {ref} "
+            f"({DISTANCE_OFFSET_M + ref * dx:.1f} m, dx {dx:g} m)")
+    else:
+        ref = int(SELECTED_CHANNEL)
+    if not c0 <= ref <= c1:
+        raise StopRun(f"selected Ch {ref} ({DISTANCE_OFFSET_M + ref * dx:.0f} m) is outside the plotted range "
+                      f"Ch {c0}-{c1} ({DISTANCE_OFFSET_M + c0 * dx:.0f}-{DISTANCE_OFFSET_M + c1 * dx:.0f} m)")
+    return list(range(c0, c1 + 1)), ref
+
+
+def cache_key(ta, tb, chans, ref, fs, q, L):
+    #everything that changes the processed data; plot-only settings (VMAX, ylim, dpi, ticks...) are not in it
+    d = dict(ta=ta, tb=tb, c0=chans[0], c1=chans[-1], ref=ref, fs=fs, q=q, bp=APPLY_BANDPASS,
+             band=[F_LOW, F_HIGH, FILTER_ORDER], rows=MAX_PLOT_TIME_ROWS, cm=COMMON_MODE, gap=SHORT_GAP_SEC,
+             qty="raw_strain_rate", v=4)
+    return hashlib.md5(json.dumps(d, sort_keys=True, default=str).encode()).hexdigest()[:10]
+
+
+def process_window(stamped, file_sec, t_start, t_end, name):
+    #reads, conditions and reduces one window: waterfall image (rows x channels) and the selected-channel
+    #trace at fs_eff, both in plotted units. Cached per window.
+    ta, tb = to_posix(t_start), to_posix(t_end)
+    pad = max(2.0, 3.0 / F_LOW) if (APPLY_BANDPASS and F_LOW) else 2.0
+    paths = files_between(stamped, file_sec, ta - pad, tb + pad)
+    if not paths:
+        raise StopRun(f"no files between {t_start} and {t_end} UTC")
+    L = report_metadata(paths[0], CABLE, need_gauge=False)
+    fs, dx = L["fs"], L["dx"]
+    chans, ref = select_channels(L)
+    iref = chans.index(ref)
+    if APPLY_BANDPASS:
+        if not F_LOW and not F_HIGH:
+            raise StopRun("APPLY_BANDPASS = True needs F_LOW and / or F_HIGH")
+        if F_HIGH and fs / 2 <= F_HIGH:
+            raise StopRun(f"F_HIGH {F_HIGH:g} Hz is above the Nyquist frequency {fs / 2:g} Hz")
+        #decimation of the trace only when a low-pass edge protects it from aliasing
+        q = max(1, int(np.floor(fs / max(FS_EFF or fs, 2.5 * F_HIGH)))) if F_HIGH else 1
+    else:
+        q = 1                                                   #raw data: every sample, no decimation
+
+    os.makedirs(CACHE_FOLDER, exist_ok=True)
+    cpath = os.path.join(CACHE_FOLDER, f"febus_{CABLE}_{name}_{cache_key(ta, tb, chans, ref, fs, q, L)}.npz")
+    if USE_CACHE and os.path.exists(cpath):
+        log(f"  cache hit: {os.path.basename(cpath)} (re-plot only)")
+        h = np.load(cpath, allow_pickle=False)
+        return {k: h[k] for k in h.files}
+
+    sos = design_filter(fs, (F_LOW, F_HIGH), FILTER_ORDER) if APPLY_BANDPASS else None
+    log(f"  {len(paths)} files, fs {fs:g} Hz, dx {dx:g} m, Ch {chans[0]}-{chans[-1]} "
+        f"({DISTANCE_OFFSET_M + chans[0] * dx:.0f}-{DISTANCE_OFFSET_M + chans[-1] * dx:.0f} m), "
+        f"selected Ch {ref} ({DISTANCE_OFFSET_M + ref * dx:.0f} m), fs_eff {fs / q:g} Hz")
+
+    blocks = [chans[i:i + CHANNEL_BLOCK] for i in range(0, len(chans), CHANNEL_BLOCK)]
+    proc = lambda x: condition(x, fs, sos).astype(np.float32)
+    streams = [FilteredStream(fs, proc, CHUNK_SEC, pad, SHORT_GAP_SEC) for _ in blocks]
+    n_samp = int(round((tb - ta) * fs))
+    nrows = min(MAX_PLOT_TIME_ROWS, int(round((tb - ta) * fs / q)))
+    img = PeakImage(ta, tb, fs, len(chans), iref, nrows, "sample")
+    n_tr = (n_samp + q - 1) // q
+    trace = np.full(n_tr, np.nan, dtype=np.float32)
+    b_ref, j_ref = iref // CHANNEL_BLOCK, iref % CHANNEL_BLOCK
+
+    def take(bi, tt, y):
+        img.add(tt, y, bi * CHANNEL_BLOCK)
+        if bi == b_ref:
+            k = int(round((tt - ta) * fs)) + np.arange(len(y))
+            m = (k >= 0) & (k < n_samp) & (k % q == 0)
+            trace[k[m] // q] = y[m, j_ref]
+
+    dropped = 0.0
+    t_read = time.time()
+    for k, p in enumerate(paths, 1):
+        for bi, bl in enumerate(blocks):
+            try:
+                x, t0, Lf = read_file(p, CABLE, bl)
+            except Exception as e:                               # noqa: BLE001
+                log(f"  skipped {os.path.basename(p)}: {e}")
+                break
+            if bi == 0:
+                dropped += Lf["dropped_sec"]
+            i0 = max(0, int(np.floor((ta - pad - t0) * fs)))
+            i1 = min(len(x), int(np.ceil((tb + pad - t0) * fs)))
+            if i1 > i0:
+                for tt, y in streams[bi].push(t0 + i0 / fs, x[i0:i1]):
+                    take(bi, tt, y)
+            del x
+        if k % 10 == 0 or k == len(paths):
+            log(f"  [{k}/{len(paths)}] files read  ({time.time() - t_read:.0f} s)")
+        gc.collect()
+    for bi, s in enumerate(streams):
+        for tt, y in s.flush():
+            take(bi, tt, y)
+    if np.all(np.isnan(img.img)):
+        raise StopRun("no data inside the window")
+
+    Z, n_rows = fill_time_gaps(img.img)
+    trace, _ = fill_time_gaps(trace)
+    log(f"  gaps: {dropped:.1f} s dropped blocks + {streams[0].filled_sec:.1f} s between files mirror-filled, "
+        f"{n_rows * img.col_sec:.1f} s interpolated ({streams[0].restarts} filter restarts)")
+    res = dict(Z=Z.astype(np.float32), trace=trace.astype(np.float32), chans=np.array(chans), ref=np.int64(ref),
+               dx=np.float64(dx), fs=np.float64(fs), fs_eff=np.float64(fs / q), gauge=np.float64(L["gauge_m"] or 0),
+               noise=img.noise_sigma().astype(np.float64), ta=np.float64(ta), tb=np.float64(tb))
+    np.savez(cpath, **res)
+    log(f"  cache saved: {os.path.basename(cpath)}")
+    return res
+
+
+def clock_ticks(ta, tb, step_min):
+    #tick seconds from ta: the start, every step_min on the clock, the end
+    tsec = tb - ta
+    if step_min is None:
+        for step_min in (0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 240):
+            if tsec / (60 * step_min) <= 8:
+                break
+    step = 60.0 * step_min
+    ticks = [0.0]
+    t = np.ceil(ta / step) * step
+    while t < tb - 1e-6:
+        if t - ta > 0.04 * tsec and tb - t > 0.04 * tsec:
+            ticks.append(t - ta)
+        t += step
+    ticks.append(tsec)
+    fmt = "%H:%M:%S" if step_min < 1 or ta % 60 or tb % 60 else "%H:%M"
+    return ticks, [from_posix(ta + s).strftime(fmt) for s in ticks]
+
+
+def plot_window(res, name, run_n):
+    Z, trace, chans = res["Z"].copy(), res["trace"], [int(c) for c in res["chans"]]
+    ref, dx, fs_eff, gl = int(res["ref"]), float(res["dx"]), float(res["fs_eff"]), float(res["gauge"])
+    ta, tb = float(res["ta"]), float(res["tb"])
+    tsec, n_t, n_ch = tb - ta, Z.shape[0], Z.shape[1]
+    qname, unit = UNIT_NAME, UNIT
+    band = (f"{F_LOW or 0:g}-{F_HIGH if F_HIGH else float(res['fs']) / 2:g} Hz" if APPLY_BANDPASS
+            else "unfiltered")
+
+    #display clipping, as in the Sintela script (the values themselves are not converted)
+    if SPIKE_CLIP:
+        np.clip(Z, -SPIKE_CLIP, SPIKE_CLIP, out=Z)
+    if PER_CH_MAD_CLIP:
+        med = np.median(Z, axis=0)
+        clip_v = np.maximum(MAD_MULT * np.median(np.abs(Z - med[None, :]), axis=0), 1e-12)
+        n_clip = int((np.abs(Z) > clip_v[None, :]).sum())
+        np.clip(Z, -clip_v[None, :], clip_v[None, :], out=Z)
+        log(f"  MAD clip: {n_clip:,} samples ({100.0 * n_clip / Z.size:.3f} %)")
+
+    noise = res["noise"]
+    ok = np.isfinite(noise) & (noise > 0)
+    sigma = float(np.median(noise[ok])) if ok.any() else float(np.std(Z))
+    vmax = float(VMAX) if VMAX else nice_limit(VMAX_SIGMA * sigma)
+    s = np.abs(Z[::max(1, n_t // 2000)]).ravel()
+    log(f"  stats |{unit}|: p50={np.percentile(s, 50):.4g}  p90={np.percentile(s, 90):.4g}  "
+        f"p99={np.percentile(s, 99):.4g}  max={s.max():.4g}  noise sigma={sigma:.4g}")
+    sat = 100.0 * float((s >= vmax).mean())
+    log(f"  VMAX={vmax:g}{'' if VMAX else ' (auto)'}  ->  {sat:.1f} % saturated"
+        + ("  (VMAX is well below the noise: set VMAX = None or raise it)" if sat > 40 else ""))
+    ylim = float(SIGNAL_YLIM) if SIGNAL_YLIM else nice_limit(1.2 * np.nanpercentile(np.abs(trace), 99.9))
+    tr_out = 100.0 * float(np.mean(np.abs(trace) > ylim))
+    if tr_out > 1:
+        log(f"  ! {tr_out:.1f} % of the trace is beyond SIGNAL_YLIM={ylim:g}, raise it or set None")
+
+    ticks, t_lbl = clock_ticks(ta, tb, TIME_TICK_INTERVAL_MIN)
+    idx = np.unique(np.r_[np.arange(0, n_ch, max(1, n_ch // CH_TICKS)), n_ch - 1])
+    if len(idx) > 2 and idx[-1] - idx[-2] < max(1, n_ch // CH_TICKS) / 3:
+        idx = np.delete(idx, -2)
+    ch_tks = [chans[i] for i in idx]
+    ch_lbl = [f"Ch {c}\n{DISTANCE_OFFSET_M + c * dx:.0f} m" for c in ch_tks]
+    t_tr = np.arange(len(trace)) / fs_eff
+
+    fig = plt.figure(figsize=(FIG_WIDTH, FIG_HEIGHT), constrained_layout=True)
+    gs = gridspec.GridSpec(1, 3, figure=fig, width_ratios=[1, 5, 0.08])
+    ax_ts, ax_wf, ax_cb = [fig.add_subplot(gs[0, i]) for i in range(3)]
+
+    im = ax_wf.imshow(Z, aspect="auto", cmap=CMAP, norm=Normalize(vmin=-vmax, vmax=vmax), origin="upper",
+                      interpolation="none", extent=[chans[0] - 0.5, chans[-1] + 0.5, tsec, 0], rasterized=True)
+    ax_wf.set_xticks(ch_tks)
+    ax_wf.set_xticklabels(ch_lbl, fontsize=9)
+    ax_wf.set_yticks(ticks)
+    ax_wf.set_yticklabels([])
+    ax_wf.set_xlabel("Channel  |  Optical Distance (m)", fontsize=12)
+    ax_wf.axvline(ref, color="magenta", lw=1.2, ls="--", alpha=0.8)
+    ax_wf.text(ref + 0.01 * n_ch, 0.01 * tsec, f"Ch {ref}", color="magenta", fontsize=10, va="top")
+    dur = f"{tsec / 3600:.2f} h" if tsec >= 3600 else f"{tsec / 60:.2f} min"
+    ax_wf.set_title(f"DAS Waterfall ({qname}, raw)  |  {band}  |  fs_eff {fs_eff:g} Hz  |  "
+                    f"GL = {gl:.2f} m  |  Ch {chans[0]}-{chans[-1]}  |  "
+                    f"{from_posix(ta):%Y-%m-%d %H:%M} UTC to {from_posix(tb):%H:%M} UTC  ({dur})",
+                    fontsize=10, pad=6)
+
+    ax_ts.plot(trace, t_tr, lw=0.25, color="steelblue", alpha=0.9, rasterized=True)
+    ax_ts.set_ylim(tsec, 0)
+    ax_ts.set_xlim(ylim, -ylim)
+    ax_ts.set_yticks(ticks)
+    ax_ts.set_yticklabels(t_lbl, fontsize=10)
+    ax_ts.axvline(0, color="gray", lw=0.5, ls="--", alpha=0.6)
+    ax_ts.set_xlabel(f"{qname} ({unit})\nCh {ref} ({band})", fontsize=10)
+    ax_ts.set_ylabel("Time (UTC)", fontsize=11)
+    ax_ts.grid(True, ls="--", alpha=0.2)
+
+    fig.colorbar(im, cax=ax_cb).set_label(f"{qname} ({unit})", fontsize=10)
+
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    path = os.path.join(OUTPUT_FOLDER, f"waterfall_{CABLE}_{name}_ch{ref}_{run_n:03d}.jpeg")
+    fig.savefig(path, dpi=DPI_SAVE, pil_kwargs={"quality": JPEG_QUALITY, "optimize": True})
+    plt.close(fig)
+    gc.collect()
+    log(f"  saved: {path}  ({os.path.getsize(path) / 1e6:.1f} MB)")
+
+
+def main():
+    global USE_CACHE
+    ap = argparse.ArgumentParser(description="Febus A1-R raw strain-rate waterfall")
+    ap.add_argument("--window", nargs=2, metavar=("START", "END"))
+    ap.add_argument("--folder")
+    ap.add_argument("--rebuild", action="store_true", help="ignore the caches")
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--inspect")
+    a, _ = ap.parse_known_args()
+    if a.inspect:
+        inspect_file(a.inspect)
+        return
+    if a.rebuild:
+        USE_CACHE = False
+    stamped, file_sec = list_files(a.folder or DATA_FOLDER, CABLE, RECURSIVE)
+    if a.list:
+        describe_coverage(stamped, file_sec, CABLE)
+        return
+    windows = WINDOWS
+    if a.window:
+        t0, t1 = parse_window_time(a.window[0]), parse_window_time(a.window[1])
+        windows = [(a.window[0], a.window[1], f"window_{t0:%H%M}_{t1:%H%M}")]
+    for ws, we, name in windows:
+        t_start, t_end = parse_window_time(ws), parse_window_time(we)
+        log(f"\n{'=' * 65}\n{name}: {t_start:%Y-%m-%d %H:%M:%S} -> {t_end:%H:%M:%S} UTC\n{'=' * 65}")
+        if t_end <= t_start:
+            log("  [!] end before start, skipped")
+            continue
+        try:
+            res = process_window(stamped, file_sec, t_start, t_end, name)
+            os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+            run_n = len([f for f in os.listdir(OUTPUT_FOLDER)
+                         if f.startswith(f"waterfall_{CABLE}_{name}_") and f.endswith(".jpeg")]) + 1
+            plot_window(res, name, run_n)
+        except StopRun as stop:
+            log(f"  STOPPED: {stop}")
+        except Exception:                                        # noqa: BLE001
+            import traceback
+            log(f"  [!] error in window {name}")
+            traceback.print_exc()
+    log("\nAll windows completed.")
+
+
+if __name__ == "__main__":
+    main()
