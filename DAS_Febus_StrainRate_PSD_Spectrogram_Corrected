@@ -1,0 +1,1784 @@
+import os
+import re
+import glob
+import time
+import datetime
+import argparse
+
+os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
+
+import numpy as np
+import h5py
+import matplotlib
+matplotlib.use("Agg")
+matplotlib.rcParams["agg.path.chunksize"] = 10000
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+
+START_TIME          = "2025-07-09 12:00:00"
+END_TIME            = "2025-07-16 12:00:00"
+WINDOW_NAME         = "2025-07-16_1200"
+DATA_FOLDER         = r"/Volumes/X9ProII/CH2"
+DATA_FILES          = []
+FILE_PATTERN        = "*.h5"
+RECURSIVE           = False
+OUTPUT_FOLDER       = r"/Volumes/X9ProII/CH2/output_spectrogram_strainrate_v2"
+CACHE_FOLDER        = r"/Volumes/X9ProII/CH2/cache_spectrogram_v2"
+LEGACY_CACHE_FOLDERS = [r"/Volumes/X9ProII/CH2/cache_spectrogram_v3", r"/Volumes/X9ProII/CH2/cache_spectrogram"]
+USE_CACHE           = True
+CACHE_CHECK_MTIME   = True
+CABLE               = "CH2"
+SELECTED_DISTS_M    = [475.0]
+CH_START            = 120
+CH_END              = 120
+CH_STEP             = 1
+DISTANCE_OFFSET_M   = None
+ZONE                = None
+F_MIN               = 0.03
+F_MAX               = 300.0
+FILTER_ORDER        = 4
+NFFT                = 8192
+NOVERLAP            = 3584
+CMAP_SPEC           = "inferno"
+SPEC_CLIM_PCT       = (0.5, 99.9)
+SPEC_CLIM_DB        = (-32.0, -10.0)
+SPEC_MAX_COLUMNS    = None
+SPEC_NORMALISE      = "none"
+SPEC_MODE           = "psd"
+COH_SEPARATION_M    = None
+COH_AVG_SEC         = None
+COH_THRESHOLD       = None
+SCAN_FILES          = 6
+FIBRE_SCAN          = True
+REFERENCE_FILE      = None
+SPEC_BG_MIN         = None
+CHANNEL_STACK       = 1
+STACK_METHOD        = "mean"
+BLOCK_STEP          = "auto"
+COMMON_MODE         = "none"
+CM_N_CHANNELS       = 32
+CM_DIST_RANGE_M     = None
+DIAGNOSE            = True
+DIAG_FILES          = 6
+UNIT_SCALE          = "micro"
+SIGNAL_YLIM         = 50
+RMS_YLIM            = 10
+YLIM_PERCENTILE     = 100.0
+YLIM_MARGIN         = 1.05
+RMS_WINDOW_SEC      = 0.4
+SIGNAL_POINTS       = 8000
+RMS_PLOT_POINTS     = 20000
+SHADE_GAPS          = True
+SHADE_FILLED_MIN_SEC = 5.0
+BLOCK_MIN           = 30.0
+PAD_SEC             = 10.0
+MAX_FILL_SEC        = 60.0
+FIG_WIDTH           = 18
+FIG_HEIGHT          = 12
+DPI_SAVE            = 640
+JPEG_QUALITY        = 95
+SAVE_METADATA       = True
+SAVE_REPORT         = True
+GAUGE_LENGTH_M      = None
+GAUGE_LENGTH_KEY    = None
+DERIVATION_TIME_MS  = None
+
+UTC = datetime.timezone.utc
+
+def log(msg):
+    print(msg, flush=True)
+
+
+class StopRun(Exception):
+    pass
+
+
+def to_posix(dt):
+    return dt.replace(tzinfo=UTC).timestamp()
+
+
+def from_posix(t):
+    return datetime.datetime.fromtimestamp(float(t), tz=UTC).replace(tzinfo=None)
+
+
+_h5_opened = set()
+
+
+def open_h5(path, retries=3):
+    _h5_opened.add(os.path.abspath(path))
+    last = None
+    for k in range(retries):
+        try:
+            try:
+                return h5py.File(path, "r", locking=False)
+            except TypeError:
+                return h5py.File(path, "r")
+        except OSError as e:
+            last = e
+            if "signature" in str(e).lower() or "truncated" in str(e).lower():
+                break
+            time.sleep(0.5 * (k + 1))
+    raise OSError(f"cannot open HDF5 file {os.path.basename(path)} ({last})")
+
+
+def find_zones(f):
+    found = []
+
+    def visit(name, obj):
+        if isinstance(obj, h5py.Group) and re.search(r"Zone\d+$", name):
+            found.append(obj)
+    f.visititems(visit)
+    return found
+
+
+def find_zone(f):
+    zones = find_zones(f)
+    if not zones:
+        return None
+    if ZONE:
+        for z in zones:
+            if z.name.rstrip("/").split("/")[-1].lower() == str(ZONE).lower():
+                return z
+        raise ValueError(f"no zone {ZONE!r} in the file, zones: {[z.name for z in zones]}")
+    return zones[0]
+
+
+def find_strain_dataset(zone, cable):
+    keys = [k for k in zone.keys() if isinstance(zone[k], h5py.Dataset) and zone[k].ndim == 3]
+    rate = [k for k in keys if "strain" in k.lower() and ("rate" in k.lower() or "|s" in k or "/s" in k.lower())]
+    strain = [k for k in keys if "strain" in k.lower()]
+    for group in (rate, strain, keys):
+        for k in group:
+            if cable and str(cable).lower() in k.lower():
+                return zone[k]
+        if group and not any(str(cable).lower() in k.lower() for k in keys):
+            return zone[group[0]]
+    return zone[keys[0]] if keys else None
+
+
+def find_time_array(f):
+    found = [None]
+
+    def visit(name, obj):
+        if found[0] is None and isinstance(obj, h5py.Dataset) and name.lower().endswith("time"):
+            found[0] = obj[:]
+    f.visititems(visit)
+    return found[0]
+
+
+_LEN_UNITS = {"m": 1.0, "meter": 1.0, "meters": 1.0, "metre": 1.0, "metres": 1.0, "km": 1e3, "cm": 1e-2,
+              "mm": 1e-3, "ft": 0.3048, "feet": 0.3048, "foot": 0.3048, "us_survey_ft": 0.3048006}
+
+
+_TIME_UNITS = {"s": 1.0, "sec": 1.0, "second": 1.0, "seconds": 1.0, "ms": 1e-3, "msec": 1e-3,
+               "millisecond": 1e-3, "milliseconds": 1e-3, "us": 1e-6, "\u00b5s": 1e-6, "microsecond": 1e-6,
+               "ns": 1e-9}
+
+
+META_PATTERNS = {
+    "gauge_length": r"(gauge|gage)[ _-]?len(gth)?([ _-]?(m|meters?|metres?))?|gl([ _-]?(m|meters?|metres?))?",
+    "derivation_time": r"deriv(ation)?[ _-]?time([ _-]?ms)?",
+}
+
+
+def h5_attr_table(h5):
+    rows = [("/", k, v) for k, v in h5.attrs.items()]
+
+    def visit(name, obj):
+        for k, v in obj.attrs.items():
+            rows.append(("/" + name, k, v))
+        if isinstance(obj, h5py.Dataset) and obj.size <= 4 and obj.dtype.kind in "fiuSO":
+            try:
+                rows.append(("/" + name.rsplit("/", 1)[0] if "/" in name else "/", name.rsplit("/", 1)[-1], obj[()]))
+            except Exception:
+                pass
+    h5.visititems(visit)
+    return rows
+
+
+def _text(v):
+    if isinstance(v, bytes):
+        return v.decode("utf-8", errors="ignore")
+    if isinstance(v, np.ndarray) and v.dtype.kind in "SO" and v.size:
+        return _text(np.ravel(v)[0])
+    return v if isinstance(v, str) else None
+
+
+def meta_number(v):
+    t = _text(v)
+    if t is not None:
+        m = re.match(r"\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*([A-Za-z\u00b5_/|]*)", t)
+        return (float(m.group(1)), (m.group(2) or None)) if m else (None, None)
+    try:
+        a = np.ravel(np.asarray(v, dtype=float))
+        return (float(a[0]), None) if a.size else (None, None)
+    except (TypeError, ValueError):
+        return None, None
+
+
+def meta_lookup(table, name, exact=None, prefer=()):
+    if exact:
+        obj, _, key = str(exact).rpartition("@")
+        hits = [r for r in table if r[1] == key and (not obj or r[0].strip("/") == obj.strip("/"))]
+    else:
+        rx = re.compile(META_PATTERNS[name], re.I)
+        hits = [r for r in table if rx.fullmatch(str(r[1]).strip())]
+        hits.sort(key=lambda r: (not any(p.lower() in r[0].lower() for p in prefer), len(r[0])))
+    for obj, key, val in hits:
+        num, unit = meta_number(val)
+        txt = _text(val)
+        if num is None and txt is None:
+            continue
+        if unit is None:
+            for o2, k2, v2 in table:
+                if o2 == obj and str(k2).lower() in (f"{key}unit".lower(), f"{key}units".lower(),
+                                                      f"{key}_unit".lower(), f"{key}_units".lower()):
+                    unit = _text(v2) or unit
+        return dict(value=num, unit=unit, text=txt, src=f"{obj}@{key}")
+    return None
+
+
+def meta_length_m(hit, what):
+    if hit is None or hit["value"] is None:
+        return None, None
+    u = (hit["unit"] or "m").strip().lower()
+    f = _LEN_UNITS.get(u)
+    note = hit["src"] + (f" [{hit['unit']}]" if hit["unit"] else "")
+    if f is None:
+        print(f"  ! unknown length unit {hit['unit']!r} for {what} at {hit['src']}, metres assumed")
+        f = 1.0
+    return hit["value"] * f, note
+
+
+def meta_time_s(hit, default_unit):
+    if hit is None or hit["value"] is None:
+        return None, None
+    u = (hit["unit"] or default_unit).strip().lower()
+    return hit["value"] * _TIME_UNITS.get(u, _TIME_UNITS[default_unit]), hit["src"] + f" [{u}]"
+
+
+def parse_raw_unit(text):
+    if not text:
+        return None, None
+    t = str(text).lower().replace(" ", "")
+    if "rad" in t:
+        return "phase", 1.0
+    if "strain" not in t and "\u03b5" not in t and not t.startswith(("ne", "ue", "\u00b5e")):
+        return None, None
+    rate = any(s in t for s in ("/s", "|s", "rate", "pers", "/sec", "s-1", "s^-1"))
+    scale = 1.0
+    for pre, s in (("nano", 1e-9), ("nstrain", 1e-9), ("n\u03b5", 1e-9), ("ne", 1e-9), ("micro", 1e-6),
+                   ("ustrain", 1e-6), ("\u00b5strain", 1e-6), ("\u00b5\u03b5", 1e-6), ("pico", 1e-12),
+                   ("pstrain", 1e-12), ("milli", 1e-3)):
+        if t.startswith(pre) or f"[{pre}" in t or f"({pre}" in t:
+            scale = s
+            break
+    return ("strain_rate" if rate else "strain"), scale
+
+
+def parse_timestamp(filename):
+    m = re.search(r"(\d{4})\W(\d{2})\W(\d{2})[_\s](\d{2})\W(\d{2})\W(\d{2})_UTC", filename)
+    if not m:
+        return None
+    try:
+        return datetime.datetime(*[int(x) for x in m.groups()])
+    except ValueError:
+        return None
+
+
+def file_layout(f, cable):
+    zone = find_zone(f)
+    if zone is None:
+        raise ValueError(f"no Zone group, top level groups {list(f.keys())}")
+    ds = find_strain_dataset(zone, cable)
+    if ds is None:
+        raise ValueError(f"no 3-D strain rate dataset in {zone.name}, keys {list(zone.keys())}")
+    nb, spb, nch = ds.shape
+    sp = np.asarray(zone.attrs.get("Spacing", [1.0, 1.0])).ravel()
+    dx, fs = float(sp[0]), 1000.0 / float(sp[1])
+    ov = float(np.asarray(zone.attrs.get("BlockOverlap", [0])).ravel()[0])
+    usable = int(round(spb / (1.0 + ov / 100.0)))
+    trim = (spb - usable) // 2
+    table = h5_attr_table(f)
+    g, g_src = meta_length_m(meta_lookup(table, "gauge_length", exact=GAUGE_LENGTH_KEY,
+                                         prefer=("Source", "Zone")), "gauge length")
+    if GAUGE_LENGTH_M:
+        g, g_src = float(GAUGE_LENGTH_M), "setting GAUGE_LENGTH_M (override)"
+    hit = meta_lookup(table, "derivation_time", prefer=("Source", "Zone"))
+    dt_s, dt_src = meta_time_s(hit, "ms")
+    if hit is not None and hit["unit"] is None and hit["value"] is not None and hit["value"] < 0.1:
+        dt_s, dt_src = hit["value"], hit["src"] + " [s, value below 0.1]"
+    if DERIVATION_TIME_MS:
+        dt_s, dt_src = float(DERIVATION_TIME_MS) / 1000.0, "setting DERIVATION_TIME_MS (override)"
+    kind, unit_scale = parse_raw_unit(ds.name.rsplit("/", 1)[-1])
+    x0, x0_src = 0.0, "no Origin attribute: 0 m"
+    org = zone.attrs.get("Origin")
+    ext = zone.attrs.get("Extent")
+    if org is not None and np.size(org):
+        x0, x0_src = float(np.ravel(org)[0]), f"{zone.name}@Origin[0]"
+    if ext is not None and np.size(ext) >= 2:
+        e = np.ravel(ext)
+        if int(round(e[1] - e[0])) + 1 == nch and abs(e[0]) > 0:
+            x0 += float(e[0]) * dx
+            x0_src += f" + Extent[0] ({int(e[0])}) x dx"
+    return ds, {"n_blocks": nb, "spb": spb, "n_ch": nch, "usable": usable, "trim": trim,
+                "x0": x0, "x0_src": x0_src, "zone": zone.name, "zones": "; ".join(z.name for z in find_zones(f)),
+                "n_keep": spb - 2 * trim, "dx": dx, "dx_src": f"{zone.name}@Spacing[0] [m]",
+                "fs": fs, "fs_src": f"{zone.name}@Spacing[1] [ms]", "gauge_m": g, "gauge_src": g_src,
+                "dt_s": dt_s, "dt_src": dt_src, "unit_kind": kind, "unit_scale": unit_scale,
+                "dataset": ds.name}
+
+
+def read_file(path, cable, channels):
+    with open_h5(path) as f:
+        ds, L = file_layout(f, cable)
+        ch = np.asarray(channels, dtype=int)
+        if ch.size == 0 or ch.min() < 0 or ch.max() >= L["n_ch"]:
+            raise ValueError(f"channels outside 0..{L['n_ch'] - 1} in {os.path.basename(path)}")
+        tb = find_time_array(f)
+        tb = None if tb is None else np.asarray(tb, dtype=np.float64).ravel()
+        nb, spb, fs = L["n_blocks"], L["spb"], L["fs"]
+        nk = L["n_keep"]
+        if tb is not None and tb.size == nb and nb > 1:
+            d = np.diff(tb)
+            d = d[d > 0]
+            if d.size:
+                step = int(round(np.median(d) * fs))
+                if 0 < step <= spb:
+                    nk = step
+        if _step_override and 0 < _step_override <= spb:
+            nk = int(_step_override)
+        a = (spb - nk) // 2
+        b = a + nk
+        c0, c1 = int(ch.min()), int(ch.max()) + 1
+        if c1 - c0 <= 4 * len(ch):
+            raw = ds[:, a:b, c0:c1][:, :, ch - c0]
+        else:
+            raw = np.stack([ds[:, a:b, int(c)] for c in ch], axis=-1)
+        raw = raw.astype(np.float32)
+    x = raw.reshape(-1, len(ch))
+    L["dropped_sec"] = 0.0
+    L["time_note"] = ""
+    ts = parse_timestamp(os.path.basename(path))
+    t_name = to_posix(ts) if ts is not None else None
+    good_tb = tb is not None and tb.size == nb and np.all(np.isfinite(tb))
+    if good_tb and nb > 1 and np.any(np.diff(tb) <= 0):
+        good_tb = False
+        L["time_note"] = "block times not increasing: blocks placed end to end from the file-name time"
+    if good_tb and t_name is not None and abs(float(tb[0]) - t_name) > max(120.0, 2.0 * nb * nk / fs):
+        good_tb = False
+        L["time_note"] = (f"block times ({from_posix(tb[0]):%Y-%m-%d %H:%M:%S}) far from the file-name time: "
+                          f"blocks placed end to end from the file-name time")
+    if good_tb:
+        start = tb - 0.5 * nk / fs
+        t0 = float(start[0])
+        per = float(np.median(np.diff(tb)[np.diff(tb) > 0])) if nb > 1 and np.any(np.diff(tb) > 0) else nk / fs
+        idx = np.round((tb - tb[0]) / per).astype(np.int64) * nk
+        if nb > 1 and np.any(np.diff(idx) != nk):
+            x = np.full((int(idx[-1]) + nk, len(ch)), np.nan, dtype=np.float32)
+            for i, k in enumerate(idx):
+                x[k:k + nk] = raw[i]
+            L["dropped_sec"] = float(np.isnan(x[:, 0]).sum()) / fs
+    else:
+        if t_name is None:
+            raise ValueError(f"no usable block times and no time stamp in {os.path.basename(path)}")
+        t0 = t_name
+        if not L["time_note"]:
+            L["time_note"] = "no usable block times: blocks placed end to end from the file-name time"
+    return x, t0, L
+
+
+def file_info(path, cable):
+    with open_h5(path) as f:
+        _, L = file_layout(f, cable)
+    return L
+
+
+def report_metadata(path, cable, need_gauge=False):
+    L = file_info(path, cable)
+    print(f"metadata of {os.path.basename(path)}:")
+    rows = [("gauge length", f"{L['gauge_m']:.4f} m" if L["gauge_m"] else "not found", L["gauge_src"] or "-"),
+            ("derivation time", f"{L['dt_s'] * 1e3:g} ms" if L["dt_s"] else "not found", L["dt_src"] or "-"),
+            ("channel spacing", f"{L['dx']:g} m", L["dx_src"]), ("sampling rate", f"{L['fs']:g} Hz", L["fs_src"]),
+            ("data unit", f"{L['unit_kind']} x {L['unit_scale']:g}" if L["unit_kind"] else "not recognised",
+             f"dataset name {L['dataset']}"), ("channels", str(L["n_ch"]), "data shape")]
+    for name, val, src in rows:
+        print(f"    {name:16s}: {val:22s} <- {src}")
+    if L["unit_kind"] and L["unit_kind"] != "strain_rate":
+        print(f"  ! the dataset name says {L['unit_kind']}, not strain rate: the axis labels say nstrain/s")
+    if L["gauge_m"] and not 0.5 <= L["gauge_m"] <= 500:
+        print(f"  ! gauge length {L['gauge_m']:g} m is unusual, check its unit ({L['gauge_src']})")
+    if not L["gauge_m"]:
+        with open_h5(path) as f:
+            rx = re.compile(r"gauge|gage|length|^gl", re.I)
+            cands = [f"{o}@{k} = {str(v)[:40]}" for o, k, v in h5_attr_table(f) if rx.search(str(k))][:10]
+        msg = ("no gauge length in the metadata; attributes that could hold it: " + ("; ".join(cands) or "none") +
+               ". Set GAUGE_LENGTH_KEY to the right 'object@attribute' or GAUGE_LENGTH_M to the value, "
+               "--inspect FILE lists every attribute")
+        if need_gauge:
+            raise StopRun(msg)
+        print("  ! " + msg)
+    return L
+
+
+def inspect_file(path):
+    print(f"structure of {path}  ({os.path.getsize(path) / 1e6:.1f} MB)")
+    with open_h5(path) as f:
+        def show(name, obj):
+            kind = f"dataset {name}  shape {obj.shape}  dtype {obj.dtype}" if isinstance(obj, h5py.Dataset)\
+                else f"group   {name}"
+            print("  " + kind)
+            for k, v in obj.attrs.items():
+                print(f"            attr {k} = {str(v).replace(chr(10), ' ')[:80]}")
+        f.visititems(show)
+
+
+def list_files(folder, cable, recursive):
+
+
+    if not os.path.isdir(folder):
+        raise StopRun(f"DATA_FOLDER does not exist (is the disk mounted?): {folder}")
+    pat = os.path.join(folder, "**", FILE_PATTERN) if recursive else os.path.join(folder, FILE_PATTERN)
+    files = [p for p in sorted(glob.glob(pat, recursive=recursive))
+             if p.lower().endswith(".h5") and not os.path.basename(p).startswith(".")
+             and os.path.getsize(p) >= 10000]
+    if not files:
+        n_all = len(glob.glob(os.path.join(folder, "*")))
+        raise StopRun(f"no h5 files matching {FILE_PATTERN!r} in {folder} ({n_all} entries in the folder)")
+    if cable:
+        files = [p for p in files if not re.search(r"CH\d+", os.path.basename(p), re.I)
+                 or re.search(rf"{re.escape(cable)}(?!\d)", os.path.basename(p), re.I)]
+    stamped = sorted([(p, parse_timestamp(os.path.basename(p))) for p in files
+                      if parse_timestamp(os.path.basename(p)) is not None], key=lambda r: r[1])
+    if not stamped:
+        raise StopRun(f"no file name has a UTC time stamp like YYYY-MM-DD_HH-MM-SS_UTC, e.g. "
+                      f"{os.path.basename(files[0])}")
+    gaps = np.diff([to_posix(ts) for _, ts in stamped])
+    gaps = gaps[gaps > 0]
+    file_sec = float(np.median(gaps)) if gaps.size else 60.0
+    log(f"{len(stamped)} files in {folder}, {stamped[0][1]:%Y-%m-%d %H:%M:%S} to "
+        f"{stamped[-1][1] + datetime.timedelta(seconds=file_sec):%Y-%m-%d %H:%M:%S} UTC, {file_sec:.0f} s each")
+    return stamped, file_sec
+
+
+def describe_coverage(stamped, file_sec, cable):
+    first, last = stamped[0][1], stamped[-1][1] + datetime.timedelta(seconds=file_sec)
+    print(f"cable {cable}: {len(stamped)} files, nominal length {file_sec:.0f} s")
+    print(f"  coverage {first:%Y-%m-%d %H:%M:%S} to {last:%Y-%m-%d %H:%M:%S} UTC")
+    t = np.array([to_posix(ts) for _, ts in stamped])
+    big = np.where(np.diff(t) > 1.5 * file_sec)[0]
+    for i in big[:20]:
+        print(f"  gap {stamped[i][1] + datetime.timedelta(seconds=file_sec):%Y-%m-%d %H:%M:%S}"
+              f" to {stamped[i + 1][1]:%Y-%m-%d %H:%M:%S}")
+    if len(big) > 20:
+        print(f"  ... {len(big) - 20} more gaps")
+
+
+def files_between(stamped, file_sec, a, b, margin=5.0):
+    return [p for p, ts in stamped if to_posix(ts) - margin < b and to_posix(ts) + file_sec + margin > a]
+
+
+def check_window(stamped, file_sec, ta, tb):
+
+    first = to_posix(stamped[0][1])
+    last = to_posix(stamped[-1][1]) + file_sec
+    span = f"{from_posix(first):%Y-%m-%d %H:%M:%S} to {from_posix(last):%Y-%m-%d %H:%M:%S} UTC"
+    if tb <= first or ta >= last:
+        raise StopRun(f"the window {from_posix(ta):%Y-%m-%d %H:%M} - {from_posix(tb):%H:%M} UTC is outside the "
+                      f"recording ({span}); change WINDOWS")
+    if ta < first or tb > last:
+        log(f"  ! the window is only partly inside the recording ({span}), the rest stays empty")
+
+
+def contiguous_runs(mask):
+    if not np.any(mask):
+        return []
+    d = np.diff(np.concatenate([[0], np.asarray(mask).astype(np.int8), [0]]))
+    return list(zip(np.where(d == 1)[0], np.where(d == -1)[0]))
+
+
+def parse_window_time(txt):
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.datetime.strptime(str(txt).strip().replace("T", " "), fmt)
+        except ValueError:
+            continue
+    raise StopRun(f"cannot read the time '{txt}', use YYYY-MM-DD HH:MM")
+
+
+UNIT = "n\u03b5/s"
+
+
+def next_path(base, ext):
+
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    rx = re.compile(re.escape(base) + r"_(\d{4,})\.[A-Za-z0-9]+$")
+    used = [int(m.group(1)) for m in map(rx.match, os.listdir(OUTPUT_FOLDER)) if m]
+    return os.path.join(OUTPUT_FOLDER, f"{base}_{max(used, default=0) + 1:04d}.{ext}")
+
+
+CACHE_VERSION = 3
+
+
+_step_override = None
+
+
+_cache_stats = {"hit": 0, "built": 0, "rebuilt": 0, "off": 0}
+
+
+_rebuild = False
+
+
+def cache_tag():
+    return f"_s{int(_step_override)}" if _step_override else ""
+
+
+def cache_path(path, ch):
+    base = os.path.splitext(os.path.basename(path))[0]
+    return os.path.join(CACHE_FOLDER, f"{base}_{CABLE}_ch{ch}{cache_tag()}.npz")
+
+
+def cache_folders():
+    out = [CACHE_FOLDER] + [f for f in (LEGACY_CACHE_FOLDERS or []) if f]
+    return [f for i, f in enumerate(out) if f and f not in out[:i]]
+
+
+def cache_valid(h, st):
+    if int(h["src_size"]) != st.st_size:
+        return False
+    if CACHE_CHECK_MTIME and abs(float(h["src_mtime"]) - st.st_mtime) > 2.5:
+        return False
+    return True
+
+
+def find_cache(name, st):
+    if not USE_CACHE or _rebuild:
+        return None
+    for folder in cache_folders():
+        cp = os.path.join(folder, name)
+        if not os.path.exists(cp):
+            continue
+        try:
+            h = np.load(cp, allow_pickle=False)
+            if cache_valid(h, st):
+                return h
+            h.close()
+        except Exception:
+            continue
+    return None
+
+
+def write_channel_cache(path, ch, y, t0, L, st):
+    cp = cache_path(path, ch)
+    try:
+        os.makedirs(CACHE_FOLDER, exist_ok=True)
+        with open(cp + ".tmp", "wb") as fh:
+            np.savez(fh, x=y.astype(np.float32), t0=np.float64(t0), fs=np.float64(L["fs"]),
+                     src_size=np.int64(st.st_size), src_mtime=np.float64(st.st_mtime),
+                     version=np.int64(CACHE_VERSION), channel=np.int64(ch), time_note=str(L.get("time_note", "")))
+        os.replace(cp + ".tmp", cp)
+        _cache_stats["built"] += 1
+    except OSError as e:
+        log(f"  ! cannot write the cache in {CACHE_FOLDER} ({e}), continuing without it")
+
+
+def read_channels_cached(path, chans):
+    st = os.stat(path)
+    out, t0, info, missing = {}, None, {}, []
+    for ch in chans:
+        h = find_cache(os.path.basename(cache_path(path, ch)), st)
+        if h is None:
+            missing.append(ch)
+            continue
+        with h:
+            _cache_stats["hit"] += 1
+            out[ch] = h["x"].astype(np.float32)
+            t0 = float(h["t0"])
+            info = {"fs": float(h["fs"]), "time_note": str(h["time_note"]) if "time_note" in h.files else ""}
+    if missing:
+        y, t0m, L = read_file(path, CABLE, missing)
+        for j, ch in enumerate(missing):
+            out[ch] = y[:, j].astype(np.float32)
+            if USE_CACHE:
+                write_channel_cache(path, ch, y[:, j], t0m, L, st)
+            else:
+                _cache_stats["off"] += 1
+        if t0 is not None and abs(t0 - t0m) > 1e-6:
+            raise ValueError("cached and new channels of this file are not aligned: run with --rebuild")
+        t0 = t0m
+        info = {"fs": L["fs"], "time_note": L.get("time_note", "")}
+    n = min(len(v) for v in out.values())
+    return np.stack([out[ch][:n] for ch in chans], axis=1), t0, info
+
+
+def read_channel_cached(path, ch):
+    y, t0, info = read_channels_cached(path, [ch])
+    return y, t0, info
+
+
+UNIT_SR = "n\u03b5/s"
+_layouts = {}
+_report = {"skipped": {}, "notes": {}, "fs_changes": {}, "layout_changes": {}, "excluded": {}, "cm": None, "scan": None,
+           "ref": None}
+
+
+def unit_scale():
+    u = str(UNIT_SCALE).lower()
+    if u == "micro":
+        return "\u00b5\u03b5/s", 1e-3
+    if u == "nano":
+        return "n\u03b5/s", 1.0
+    raise StopRun('UNIT_SCALE must be "nano" or "micro"')
+
+
+def mirror_fill_1d(y, bad):
+    n = len(y)
+    for s0, s1 in contiguous_runs(bad):
+        g = s1 - s0
+        i = np.arange(g)
+        left = y[np.clip(s0 - 1 - i, 0, n - 1)] if s0 > 0 else None
+        right = y[np.clip(s1 + g - 1 - i, 0, n - 1)] if s1 < n else None
+        if left is None and right is None:
+            y[s0:s1] = 0.0
+        elif left is None:
+            y[s0:s1] = np.nan_to_num(right)
+        elif right is None:
+            y[s0:s1] = np.nan_to_num(left)
+        else:
+            tt = (i + 0.5) / g
+            y[s0:s1] = np.nan_to_num(np.cos(0.5 * np.pi * tt) * left + np.sin(0.5 * np.pi * tt) * right)
+    return y
+
+
+def nice_limit(v):
+    if not np.isfinite(v) or v <= 0:
+        return 1.0
+    e = 10.0 ** np.floor(np.log10(v))
+    for m in (1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10):
+        if m * e >= v * 0.999:
+            return m * e
+    return 10 * e
+
+
+def check_settings():
+    for k in ("F_MIN", "F_MAX", "FILTER_ORDER", "NFFT", "NOVERLAP", "RMS_WINDOW_SEC", "BLOCK_MIN", "PAD_SEC",
+              "MAX_FILL_SEC", "DPI_SAVE", "JPEG_QUALITY", "FIG_WIDTH", "FIG_HEIGHT", "SCAN_FILES",
+              "CM_N_CHANNELS", "DIAG_FILES", "RMS_PLOT_POINTS", "SIGNAL_POINTS", "SHADE_FILLED_MIN_SEC",
+              "CHANNEL_STACK"):
+        v = globals()[k]
+        if isinstance(v, bool) or not isinstance(v, (int, float, np.integer, np.floating)):
+            raise StopRun(f"{k} = {v!r} is not a number")
+    for k in ("SIGNAL_YLIM", "RMS_YLIM", "SPEC_MAX_COLUMNS", "CH_START", "CH_END", "YLIM_PERCENTILE", "YLIM_MARGIN",
+              "SPEC_BG_MIN", "DISTANCE_OFFSET_M", "COH_SEPARATION_M", "COH_AVG_SEC", "COH_THRESHOLD"):
+        v = globals()[k]
+        if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float, np.integer, np.floating))):
+            raise StopRun(f"{k} = {v!r} is not a number or None")
+    unit_scale()
+    if SPEC_NORMALISE not in ("none", "time", "frequency", "rolling"):
+        raise StopRun('SPEC_NORMALISE must be "none", "rolling", "frequency" or "time"')
+    if SPEC_MODE not in ("psd", "coherent"):
+        raise StopRun('SPEC_MODE must be "psd" or "coherent"')
+    if STACK_METHOD not in ("mean", "median"):
+        raise StopRun('STACK_METHOD must be "mean" or "median"')
+    if int(CHANNEL_STACK) < 1:
+        raise StopRun("CHANNEL_STACK must be 1 or more")
+    if not (BLOCK_STEP in (None, "auto") or (isinstance(BLOCK_STEP, int) and BLOCK_STEP > 0)):
+        raise StopRun('BLOCK_STEP must be "auto", None or a number of samples')
+    if COMMON_MODE not in ("none", "median"):
+        raise StopRun('COMMON_MODE must be "none" or "median"')
+    if not 0 < float(YLIM_PERCENTILE or 100.0) <= 100:
+        raise StopRun("YLIM_PERCENTILE must be in (0, 100]")
+    if CABLE not in ("CH1", "CH2"):
+        raise StopRun('CABLE must be "CH1" or "CH2"')
+    if not 0 <= NOVERLAP < NFFT:
+        raise StopRun("NOVERLAP must be 0 .. NFFT - 1")
+
+
+_db = {"layout": None, "meta": None, "dirty": set()}
+
+
+def db_path(kind):
+    return os.path.join(CACHE_FOLDER, f"{kind}_{CABLE}.json")
+
+
+def db_load(kind):
+    import json
+    if _db[kind] is None:
+        _db[kind] = {}
+        if USE_CACHE and not _rebuild:
+            for folder in reversed(cache_folders()):
+                fp = os.path.join(folder, f"{kind}_{CABLE}.json")
+                if os.path.exists(fp):
+                    try:
+                        with open(fp, encoding="utf-8") as fh:
+                            _db[kind].update(json.load(fh))
+                    except Exception:
+                        pass
+    return _db[kind]
+
+
+def db_save():
+    import json
+    if not USE_CACHE:
+        return
+    for kind in list(_db["dirty"]):
+        try:
+            os.makedirs(CACHE_FOLDER, exist_ok=True)
+            fp = db_path(kind)
+            with open(fp + ".tmp", "w", encoding="utf-8") as fh:
+                json.dump(_db[kind], fh)
+            os.replace(fp + ".tmp", fp)
+        except OSError as e:
+            log(f"  ! cannot write {db_path(kind)} ({e})")
+    _db["dirty"].clear()
+
+
+def x0_of(L):
+    return float(DISTANCE_OFFSET_M) if DISTANCE_OFFSET_M is not None else float(L.get("x0", 0.0) or 0.0)
+
+
+def layout_of(path):
+    if path in _layouts:
+        return _layouts[path]
+    db = db_load("layout")
+    n, size = os.path.basename(path), os.path.getsize(path)
+    e = db.get(n)
+    if e is not None and e.get("src_size") == size and "x0" in e and e.get("zone_setting") == str(ZONE):
+        L = dict(e)
+    else:
+        L = file_info(path, CABLE)
+        L = {k: v for k, v in L.items() if isinstance(v, (int, float, str, bool)) or v is None}
+        L["src_size"] = size
+        L["zone_setting"] = str(ZONE)
+        db[n] = L
+        _db["dirty"].add("layout")
+    _layouts[path] = L
+    return L
+
+
+def targets_from_settings(L):
+    dx, n_ch = L["dx"], L["n_ch"]
+    if SELECTED_DISTS_M:
+        vals = SELECTED_DISTS_M if isinstance(SELECTED_DISTS_M, (list, tuple)) else [SELECTED_DISTS_M]
+        out = []
+        for d in vals:
+            if isinstance(d, bool) or not isinstance(d, (int, float, np.integer, np.floating)):
+                raise StopRun(f"SELECTED_DISTS_M contains {d!r}, not a distance in m")
+            out.append(float(d))
+    else:
+        c0 = int(CH_START or 0)
+        c1 = n_ch - 1 if CH_END is None else int(CH_END)
+        out = [x0_of(L) + c * dx for c in range(c0, c1 + 1, max(1, int(CH_STEP)))]
+    for d in out:
+        ch = int(round((d - x0_of(L)) / dx))
+        if not 0 <= ch < n_ch:
+            raise StopRun(f"{d:g} m is outside the data of the first file (Ch 0-{n_ch - 1}, "
+                          f"{x0_of(L):.0f}-{x0_of(L) + (n_ch - 1) * dx:.0f} m)")
+    if not out:
+        raise StopRun("no channel selected")
+    return list(dict.fromkeys(out))
+
+
+def cm_channels(L):
+    n_ch, dx = L["n_ch"], L["dx"]
+    if CM_DIST_RANGE_M:
+        d0, d1 = CM_DIST_RANGE_M
+    else:
+        d0, d1 = x0_of(L) + 0.05 * (n_ch - 1) * dx, x0_of(L) + 0.90 * (n_ch - 1) * dx
+    c = np.round((np.linspace(d0, d1, int(CM_N_CHANNELS)) - x0_of(L)) / dx).astype(int)
+    return sorted(set(int(v) for v in np.clip(c, 0, n_ch - 1)))
+
+
+def read_cm_cached(path):
+    L = layout_of(path)
+    chans = cm_channels(L)
+    st = os.stat(path)
+    base = os.path.splitext(os.path.basename(path))[0]
+    tag = f"{chans[0]}-{chans[-1]}n{len(chans)}"
+    name = f"{base}_{CABLE}_cm_{tag}{cache_tag()}.npz"
+    h = find_cache(name, st)
+    if h is not None:
+        with h:
+            return h["x"].astype(np.float32), float(h["t0"])
+    x, t0, _ = read_file(path, CABLE, chans)
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        cm = np.nanmedian(x, axis=1).astype(np.float32)
+    if USE_CACHE:
+        cp = os.path.join(CACHE_FOLDER, name)
+        try:
+            os.makedirs(CACHE_FOLDER, exist_ok=True)
+            with open(cp + ".tmp", "wb") as fh:
+                np.savez(fh, x=cm, t0=np.float64(t0), src_size=np.int64(st.st_size),
+                         src_mtime=np.float64(st.st_mtime), version=np.int64(CACHE_VERSION))
+            os.replace(cp + ".tmp", cp)
+        except OSError:
+            pass
+    return cm, t0
+
+
+def read_dist(path, dist, fs_target, use_cm, off=0):
+    from fractions import Fraction
+    from scipy.signal import resample_poly
+    L = layout_of(path)
+    ch = int(round((dist - x0_of(L)) / L["dx"])) + int(off)
+    if not 0 <= ch < L["n_ch"]:
+        raise ValueError(f"{dist:g} m is outside this file (Ch 0-{L['n_ch'] - 1}, dx {L['dx']:g} m)")
+    h = max(0, (int(CHANNEL_STACK) - 1) // 2)
+    chans = [c for c in range(ch - h, ch + h + 1) if 0 <= c < L["n_ch"]]
+    Y, t0, Lf = read_channels_cached(path, chans)
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        y = (np.nanmedian(Y, axis=1) if STACK_METHOD == "median" else np.nanmean(Y, axis=1)).astype(np.float64)
+    note = Lf.get("time_note") if isinstance(Lf, dict) else ""
+    if note:
+        _report["notes"][os.path.basename(path)] = note
+    if use_cm:
+        cm, tc = read_cm_cached(path)
+        if abs(tc - t0) < 0.5 / L["fs"] and len(cm) == len(y):
+            y = y - cm
+        else:
+            _report["notes"][os.path.basename(path)] = "common mode not aligned with the channel: not removed"
+    fs = L["fs"]
+    if abs(fs - fs_target) > 1e-6:
+        fr = Fraction(fs_target / fs).limit_denominator(1000)
+        bad = np.isnan(y)
+        yy = resample_poly(np.nan_to_num(y), fr.numerator, fr.denominator)
+        bb = resample_poly(bad.astype(float), fr.numerator, fr.denominator) > 0.01
+        yy[bb[:len(yy)]] = np.nan
+        y = yy
+        _report["fs_changes"][os.path.basename(path)] = f"{fs:g} Hz resampled to {fs_target:g} Hz"
+    return y, t0, ch, L
+
+
+def collect(stamped, file_sec, ta, tb, dist, fs, use_cm, offsets=(0,)):
+    a, b = ta - PAD_SEC, tb + PAD_SEC
+    xs = {o: np.full(int(round((b - a) * fs)), np.nan) for o in offsets}
+    chs = set()
+    for p in files_between(stamped, file_sec, a, b):
+        for o in offsets:
+            try:
+                y, t0, ch, L = read_dist(p, dist, fs, use_cm, o)
+            except Exception as e:
+                _report["skipped"][os.path.basename(p)] = str(e)
+                log(f"  ! {os.path.basename(p)} not used: {e}")
+                break
+            if o == 0:
+                chs.add((ch, L["dx"], L["gauge_m"]))
+            x = xs[o]
+            i0 = int(round((t0 - a) * fs))
+            s0, s1 = max(0, i0), min(len(x), i0 + len(y))
+            if s1 > s0:
+                seg = y[s0 - i0:s1 - i0]
+                ok = ~np.isnan(seg)
+                x[s0:s1][ok] = seg[ok]
+    if tuple(offsets) == (0,):
+        return xs[0], int(round(PAD_SEC * fs)), chs
+    return xs, int(round(PAD_SEC * fs)), chs
+
+
+def coh_avg_sec(total):
+    return float(COH_AVG_SEC) if COH_AVG_SEC else float(np.clip(total / 2000.0, 5.0, 60.0))
+
+
+def coh_offset(L):
+    dx = L["dx"]
+    sep = float(COH_SEPARATION_M) if COH_SEPARATION_M else max((L.get("gauge_m") or dx) + dx, 2.0 * dx)
+    return max(1, int(np.ceil(sep / (2.0 * dx))))
+
+
+def scan_index(r, d):
+    return int(np.clip(round((d - float(r["x0"])) / float(r["dx"])), 0, len(r["rms"]) - 1))
+
+
+def fibre_scan(sel, targets):
+    import hashlib
+    import json
+    from scipy.signal import butter, sosfiltfilt
+    from scipy.ndimage import median_filter
+    p = sel[0][0]
+    L = layout_of(p)
+    fs, dx, n_ch = L["fs"], L["dx"], L["n_ch"]
+    k = max(1, int(np.ceil((L.get("gauge_m") or dx) / dx)) + 1)
+    key = hashlib.md5(json.dumps([os.path.basename(p), os.path.basename(sel[-1][0]), len(sel), F_MIN, F_MAX, k, CABLE, str(ZONE),
+                                  x0_of(L), int(SCAN_FILES), int(NFFT), 3]).encode()).hexdigest()[:12]
+    rp = os.path.join(CACHE_FOLDER, "results", f"fibrescan_{key}.npz")
+    r = None
+    for folder in (cache_folders() if USE_CACHE and not _rebuild else []):
+        cand = os.path.join(folder, "results", f"fibrescan_{key}.npz")
+        if os.path.exists(cand):
+            with np.load(cand) as h:
+                r = {kk: h[kk] for kk in h.files}
+            break
+    if r is None:
+        from scipy.signal import csd, welch
+        use = [sel[i][0] for i in np.unique(np.linspace(0, len(sel) - 1, min(len(sel), int(SCAN_FILES))).astype(int))]
+        sos = butter(FILTER_ORDER, [F_MIN, F_MAX], btype="bandpass", fs=fs, output="sos")
+        Pxx = Pxy = f = None
+        ss = np.zeros(n_ch)
+        nn = 0
+        nseg = 0
+        for q in use:
+            if layout_of(q)["n_ch"] != n_ch:
+                continue
+            log(f"  fibre scan: reading all {n_ch} channels of {os.path.basename(q)}")
+            X, _, _ = read_file(q, CABLE, list(range(n_ch)))
+            X = np.nan_to_num(X)
+            nper = coh_spectra(X, fs)
+            for c0 in range(0, n_ch, 64):
+                n_out = min(64, n_ch - c0)
+                Y = X[:, c0:min(n_ch, c0 + n_out + k)].astype(np.float64)
+                ss[c0:c0 + n_out] += np.sum(sosfiltfilt(sos, Y[:, :n_out], axis=0) ** 2, axis=0)
+                ff, pxx = welch(Y, fs=fs, nperseg=nper, axis=0)
+                m = min(n_out, Y.shape[1] - k)
+                if f is None:
+                    f = ff
+                    Pxx = np.zeros((len(ff), n_ch))
+                    Pxy = np.zeros((len(ff), n_ch), dtype=complex)
+                Pxx[:, c0:c0 + n_out] += pxx[:, :n_out]
+                if m > 0:
+                    Pxy[:, c0:c0 + m] += csd(Y[:, :m], Y[:, k:k + m], fs=fs, nperseg=nper, axis=0)[1]
+            nn += len(X)
+            nseg += 2 * (len(X) // nper) - 1
+            del X
+        if f is None:
+            raise StopRun("no file for the fibre scan")
+        band = (f >= F_MIN) & (f <= F_MAX)
+        Pyy = np.concatenate([Pxx[:, k:], np.full((len(f), k), np.nan)], axis=1)
+        C = np.abs(Pxy) ** 2 / np.maximum(Pxx * Pyy, 1e-300)
+        coh = np.max(C[band], axis=0)
+        coh[n_ch - k:] = np.nan
+        r = dict(rms=np.sqrt(ss / max(nn, 1)), coh=coh, x0=x0_of(L), dx=dx, k=k, nseg=nseg, nbins=int(band.sum()),
+                 fname=f"{os.path.basename(use[0])} (+{len(use) - 1} files)")
+        if USE_CACHE:
+            try:
+                os.makedirs(os.path.dirname(rp), exist_ok=True)
+                with open(rp + ".tmp", "wb") as fh:
+                    np.savez(fh, **r)
+                os.replace(rp + ".tmp", rp)
+            except OSError:
+                pass
+    pos = float(r["x0"]) + np.arange(len(r["rms"])) * float(r["dx"])
+    coh = np.asarray(r["coh"], dtype=float)
+    cs = median_filter(np.nan_to_num(coh), size=5, mode="nearest")
+    thr = coh_threshold(int(r.get("nseg", 0)), int(r.get("nbins", 100)))
+    good = cs > thr
+    fig, (a1, a2) = plt.subplots(2, 1, figsize=(14, 7), sharex=True, gridspec_kw=dict(hspace=0.08))
+    a1.semilogy(pos, np.maximum(r["rms"], 1e-12), lw=0.7, color="steelblue")
+    a1.set_ylabel(f"{F_MIN:g}-{F_MAX:g} Hz RMS (n\u03b5/s)")
+    a2.plot(pos, coh, lw=0.5, color="0.6", label="coherence")
+    a2.plot(pos, cs, lw=1.2, color="darkorange", label="smoothed")
+    a2.axhline(thr, color="0.4", ls=":", lw=0.8)
+    a2.set_ylim(0, max(0.2, min(1.0, 1.2 * float(np.nanmax(coh)) if np.isfinite(coh).any() else 1.0)))
+    a2.set_ylabel(f"coherence with channel +{int(r['k'])}\n(strongest frequency in {F_MIN:g}-{F_MAX:g} Hz)")
+    a2.set_xlabel("Optical distance (m)")
+    a2.legend(loc="upper right", fontsize=8)
+    for ax in (a1, a2):
+        ax.grid(True, ls="--", alpha=0.3)
+        for d in targets:
+            ax.axvline(d, color="red", lw=1.0)
+    a1.set_title(f"Fibre scan  |  {r['fname']}  |  {F_MIN:g}-{F_MAX:g} Hz  |  red: selected distance(s)\n"
+                 f"coherence near 0 = instrument noise only, high = ground signal", fontsize=10)
+    path = next_path(f"fibrescan_{CABLE}_{WINDOW_NAME}", "jpeg")
+    fig.savefig(path, format="jpeg", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    log(f"  fibre scan: {path}")
+    runs = [(float(pos[a_]), float(pos[b_ - 1])) for a_, b_ in contiguous_runs(good) if b_ - a_ >= 5]
+    log(f"    stretches with ground signal (coherence > {thr:.3f}, the noise-only level): "
+        + (", ".join(f"{a_:.0f}-{b_:.0f} m" for a_, b_ in runs[:12]) if runs else "none in this file"))
+    at = {}
+    for d in targets:
+        j = scan_index(r, d)
+        at[float(d)] = float(cs[j])
+        log(f"    at {d:g} m: coherence {cs[j]:.2f}, RMS {r['rms'][j]:.4g} n\u03b5/s"
+            + ("  -> ground signal" if cs[j] > thr else "  -> instrument noise only at this distance"))
+    _report["scan"] = {"file": str(r["fname"]), "runs": runs, "at": at}
+    prof = np.asarray(r["rms"], dtype=float)
+    inner = prof[int(0.05 * len(prof)):int(0.95 * len(prof))]
+    spread = float(np.nanpercentile(inner, 90) / max(np.nanpercentile(inner, 10), 1e-30)) if inner.size else np.nan
+    _report["scan"]["spread"] = spread
+    log(f"    {F_MIN:g}-{F_MAX:g} Hz level along the fibre: 90th / 10th percentile = {spread:.2f}"
+        + ("  (the same everywhere: typical of instrument noise)" if spread < 1.3 else "  (varies along the fibre)"))
+    if not runs:
+        log("    ! NO stretch of the fibre shares a signal between neighbouring channels in this window: the recording "
+            "holds instrument noise only. Display settings, common-mode removal or stacking cannot create events "
+            "that are not in the data; compare the acquisition settings with a good period (REFERENCE_FILE)")
+
+
+def block_check(path, dist):
+    L = layout_of(path)
+    ch = int(round((dist - x0_of(L)) / L["dx"]))
+    with open_h5(path) as f:
+        ds, _ = file_layout(f, CABLE)
+        raw = ds[:, :, ch].astype(np.float64)
+        tb = find_time_array(f)
+    nb, spb = raw.shape
+    if nb < 3 or tb is None or np.size(tb) != nb:
+        return None
+    tb = np.asarray(tb, dtype=np.float64).ravel()
+    d = np.diff(tb)
+    per = float(np.median(d[d > 0])) if np.any(d > 0) else 0.0
+    nk_time = int(round(per * L["fs"])) if per else spb
+    pairs = [i for i in range(nb - 1) if per and abs(d[i] - per) < 0.1 * per][:30]
+    if not pairs or nk_time >= spb:
+        return {"file": os.path.basename(path), "spb": spb, "nk_time": nk_time, "best": nk_time, "r_best": np.nan,
+                "r_time": np.nan, "overlap": max(0, spb - nk_time)}
+    raw = raw - raw.mean(axis=1, keepdims=True)
+
+    def score(sft):
+        rs = []
+        for i in pairs:
+            a, b = raw[i, sft:], raw[i + 1, :spb - sft]
+            if a.size > 8 and np.std(a) > 0 and np.std(b) > 0:
+                rs.append(np.corrcoef(a, b)[0, 1])
+        return float(np.median(rs)) if rs else np.nan
+    cands = range(max(1, nk_time - 200), min(spb - 8, nk_time + 200) + 1)
+    sc = {k: score(k) for k in cands}
+    best = max(sc, key=lambda k: -np.inf if np.isnan(sc[k]) else sc[k])
+    return {"file": os.path.basename(path), "spb": spb, "nk_time": nk_time, "best": best, "r_best": sc[best],
+            "r_time": sc.get(nk_time, np.nan), "overlap": spb - nk_time}
+
+
+def coh_threshold(nseg, nbins):
+    return float(COH_THRESHOLD) if COH_THRESHOLD else float(min(0.6, 2.5 * np.log(max(nbins, 2)) / max(nseg, 1)))
+
+
+def coh_spectra(Y, fs):
+    return int(NFFT) if int(NFFT) <= Y.shape[0] // 4 else int(2 ** np.floor(np.log2(Y.shape[0] // 4)))
+
+
+def coherence_check(path, dist):
+    from scipy.signal import butter, sosfiltfilt, csd, welch
+    L = layout_of(path)
+    fs, dx = L["fs"], L["dx"]
+    ch = int(round((dist - x0_of(L)) / dx))
+    k = max(1, int(np.ceil((L.get("gauge_m") or dx) / dx)) + 1)
+    far = int(round(100.0 / dx))
+    near_c = [c for c in (ch - k, ch + k) if 0 <= c < L["n_ch"]]
+    if not near_c:
+        k = 1
+        near_c = [c for c in (ch - 1, ch + 1) if 0 <= c < L["n_ch"]]
+    far_c = [c for c in (ch + far, ch - far) if 0 <= c < L["n_ch"]][:1]
+    Y, _, _ = read_channels_cached(path, [ch] + near_c + far_c)
+    Y = np.nan_to_num(Y.astype(np.float64))
+    sos = butter(FILTER_ORDER, [F_MIN, F_MAX], btype="bandpass", fs=fs, output="sos")
+    Yb = sosfiltfilt(sos, Y, axis=0)
+    nper = coh_spectra(Y, fs)
+    f, Pxx = welch(Y[:, 0], fs=fs, nperseg=nper)
+    out = {"file": os.path.basename(path), "k": k, "rms": float(np.sqrt(np.mean(Yb[:, 0] ** 2))), "f": f,
+           "Pxx": Pxx, "nseg": 2 * (len(Y) // nper) - 1}
+    for name, cols in (("near", list(range(1, 1 + len(near_c)))), ("far", list(range(1 + len(near_c), Y.shape[1])))):
+        if cols:
+            c = cols[0]
+            out[name + "_Pyy"] = welch(Y[:, c], fs=fs, nperseg=nper)[1]
+            out[name + "_Pxy"] = csd(Y[:, 0], Y[:, c], fs=fs, nperseg=nper)[1]
+    return out
+
+
+def combine_coherence(rows, name):
+    rows = [r for r in rows if name + "_Pxy" in r and len(r["f"]) == len(rows[0]["f"])]
+    if not rows:
+        return np.nan, 0, 0, np.nan
+    f = rows[0]["f"]
+    Pxx = sum(r["Pxx"] for r in rows)
+    Pyy = sum(r[name + "_Pyy"] for r in rows)
+    Pxy = sum(r[name + "_Pxy"] for r in rows)
+    C = np.abs(Pxy) ** 2 / np.maximum(Pxx * Pyy, 1e-300)
+    m = (f >= F_MIN) & (f <= F_MAX)
+    j = int(np.argmax(np.where(m, C, -1)))
+    return float(C[j]), int(sum(r["nseg"] for r in rows)), int(m.sum()), float(f[j])
+
+
+def cm_check(path, dist, fs):
+    from scipy.signal import butter, sosfiltfilt
+    sos = butter(FILTER_ORDER, [F_MIN, F_MAX], btype="bandpass", fs=fs, output="sos")
+    y, t0, _, L = read_dist(path, dist, fs, False)
+    cm, tc = read_cm_cached(path)
+    if len(cm) != len(y) or abs(tc - t0) > 0.5 / fs:
+        return np.nan
+    ok = ~(np.isnan(y) | np.isnan(cm))
+    if ok.sum() < 10 * fs:
+        return np.nan
+    yf = sosfiltfilt(sos, np.where(ok, y, 0.0))[ok]
+    cf = sosfiltfilt(sos, np.where(ok, cm, 0.0))[ok]
+    return float(np.corrcoef(yf, cf)[0, 1] ** 2)
+
+
+def diagnose(sel, dist, fs):
+    global _step_override
+    pick = [sel[i][0] for i in np.unique(np.linspace(0, len(sel) - 1, min(len(sel), int(DIAG_FILES))).astype(int))]
+    diag = {"block": [], "coh": [], "cm": []}
+    log(f"\n  DIAGNOSIS at {dist:g} m ({len(pick)} files spread over the window)")
+    for p in pick[:3]:
+        try:
+            r = block_check(p, dist)
+            if r:
+                diag["block"].append(r)
+        except Exception as e:
+            log(f"  ! block check of {os.path.basename(p)} failed: {e}")
+    if diag["block"]:
+        r0 = diag["block"][0]
+        bests = sorted({r["best"] for r in diag["block"]})
+        rb = np.nanmedian([r["r_best"] for r in diag["block"]])
+        rt = np.nanmedian([r["r_time"] for r in diag["block"]])
+        if np.isnan(rb):
+            log(f"    block joins: {r0['spb']} samples per block, step {r0['nk_time']} from the time stamps, no "
+                f"overlap to check")
+        else:
+            log(f"    block joins: {r0['spb']} samples per block, step from the time stamps {r0['nk_time']}, "
+                f"step from the repeated overlap data {bests[0] if len(bests) == 1 else bests} "
+                f"(match {rb:.3f}, at the time-stamp step {rt:.3f})")
+            if BLOCK_STEP == "auto" and len(bests) == 1 and bests[0] != r0["nk_time"] and rb > 0.9 and rb - rt > 0.1:
+                _step_override = int(bests[0])
+                log(f"    ! the time stamps give the wrong block step: every block join had a glitch. "
+                    f"Using {_step_override} samples per block (separate cache files, suffix _s{_step_override})")
+            elif isinstance(BLOCK_STEP, int):
+                _step_override = int(BLOCK_STEP)
+                log(f"    block step set to {_step_override} samples (BLOCK_STEP)")
+            else:
+                log("    block joins are seamless")
+    for p in pick:
+        try:
+            diag["coh"].append(coherence_check(p, dist))
+        except Exception as e:
+            log(f"  ! coherence check of {os.path.basename(p)} failed: {e}")
+        try:
+            diag["cm"].append((os.path.basename(p), cm_check(p, dist, fs)))
+        except Exception as e:
+            log(f"  ! common-mode check of {os.path.basename(p)} failed: {e}")
+    if diag["coh"]:
+        near, nseg, nb, fnear = combine_coherence(diag["coh"], "near")
+        far = combine_coherence(diag["coh"], "far")[0]
+        k = diag["coh"][0]["k"]
+        thr = coh_threshold(nseg, nb)
+        diag["coh_summary"] = {"near": near, "far": far, "k": k, "thr": thr, "nseg": nseg, "f": fnear}
+        log(f"    coherence {F_MIN:g}-{F_MAX:g} Hz with channels {k} away: "
+            + (f"{near:.2f}" if np.isfinite(near) else "n/a") + "; with a channel ~100 m away: "
+            + (f"{far:.2f}" if np.isfinite(far) else "n/a") + "  (1 = same signal, 0 = independent noise)")
+        log(f"    (strongest frequency {fnear:.2f} Hz, {nseg} averaged pieces; pure noise stays below {thr:.3f})")
+        if near < thr:
+            log(f"    ! at no {F_MIN:g}-{F_MAX:g} Hz frequency does this channel share a signal with its neighbours: it "
+                f"records instrument noise only. Check the distance (fibre scan) or try SPEC_MODE = \"coherent\"")
+    shares = np.array([v for _, v in diag["cm"]], dtype=float)
+    if shares.size and np.isfinite(shares).any():
+        log(f"    common mode: {100 * np.nanmedian(shares):.0f} % of the {F_MIN:g}-{F_MAX:g} Hz power is common to the "
+            f"whole fibre (maximum {100 * np.nanmax(shares):.0f} %)")
+        if np.nanmax(shares) > 0.5 and COMMON_MODE == "none":
+            log("    ! a large part is common to all channels (laser / interrogator noise): set COMMON_MODE = \"median\"")
+    return diag
+
+
+def window_files(stamped, file_sec, ta, tb):
+    return [r for r in stamped if to_posix(r[1]) < tb and to_posix(r[1]) + file_sec > ta]
+
+
+def excluded_files(folder, stamped, file_sec, ta, tb):
+    used = {os.path.abspath(p) for p, _ in stamped}
+    pat = os.path.join(folder, "**", "*") if RECURSIVE else os.path.join(folder, "*")
+    out = {}
+    for p in glob.glob(pat, recursive=RECURSIVE):
+        if not p.lower().endswith(".h5") or os.path.abspath(p) in used:
+            continue
+        n = os.path.basename(p)
+        ts = parse_timestamp(n)
+        if ts is not None and not (to_posix(ts) < tb and to_posix(ts) + file_sec > ta):
+            continue
+        if n.startswith("."):
+            why = "hidden file"
+        elif ts is None:
+            why = "no UTC time stamp in the name"
+        elif os.path.getsize(p) < 10000:
+            why = f"file too small ({os.path.getsize(p)} bytes)"
+        elif not glob.fnmatch.fnmatch(n, FILE_PATTERN):
+            why = f"name does not match FILE_PATTERN {FILE_PATTERN!r}"
+        elif re.search(r"CH\d+", n, re.I):
+            why = f"name belongs to another cable than {CABLE}"
+        elif DATA_FILES:
+            why = "not in DATA_FILES"
+        else:
+            why = "excluded"
+        out[n] = why
+    return out
+
+
+def file_metadata_text(path, ts):
+    lines = [f"FILE {os.path.basename(path)}", f"  path              : {path}",
+             f"  size              : {os.path.getsize(path) / 1e6:.3f} MB",
+             f"  name time (UTC)   : {ts:%Y-%m-%d %H:%M:%S}"]
+    try:
+        with open_h5(path) as f:
+            ds, L = file_layout(f, CABLE)
+            tb = find_time_array(f)
+            table = h5_attr_table(f)
+            objs = []
+            f.visititems(lambda n, o: objs.append((n, o.shape, str(o.dtype)) if isinstance(o, h5py.Dataset) else None))
+        lines += [f"  dataset           : {L['dataset']}  shape {ds.shape}",
+                  f"  sampling rate     : {L['fs']:g} Hz", f"  channel spacing   : {L['dx']:g} m",
+                  f"  channels          : {L['n_ch']}",
+                  f"  gauge length      : {L['gauge_m']:g} m" if L["gauge_m"] else "  gauge length      : not found",
+                  f"  derivation time   : {L['dt_s'] * 1e3:g} ms" if L["dt_s"] else "  derivation time   : not found",
+                  f"  blocks            : {L['n_blocks']} x {L['spb']} samples"]
+        if tb is not None and np.size(tb):
+            tb = np.asarray(tb, dtype=np.float64).ravel()
+            d = np.diff(tb)
+            per = float(np.median(d[d > 0])) if np.any(d > 0) else 0.0
+            drop = int(np.sum(np.maximum(0, np.round(d / per) - 1))) if per else 0
+            lines += [f"  first block (UTC) : {from_posix(tb[0]):%Y-%m-%d %H:%M:%S.%f}"[:-3],
+                      f"  last block (UTC)  : {from_posix(tb[-1]):%Y-%m-%d %H:%M:%S.%f}"[:-3],
+                      f"  block period      : {per:g} s", f"  dropped blocks    : {drop}"]
+        lines.append("  datasets:")
+        lines += [f"    /{n}  shape {s}  {t}" for o in objs if o for n, s, t in [o]]
+        lines.append("  attributes:")
+        for o, k, v in table:
+            txt = str(v).replace("\n", " ")
+            lines.append(f"    {o}@{k} = {txt[:2000]}")
+    except Exception as e:
+        lines.append(f"  ! cannot read: {e}")
+    return "\n".join(lines) + "\n"
+
+
+def save_metadata(sel, file_sec, ta, tb):
+    path = next_path(f"metadata_{CABLE}_{WINDOW_NAME}", "txt")
+    t0 = time.time()
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(f"FEBUS A1-R METADATA  |  cable {CABLE}  |  {DATA_FOLDER}\n")
+        fh.write(f"created {datetime.datetime.now():%Y-%m-%d %H:%M:%S}\n")
+        fh.write(f"window  {from_posix(ta):%Y-%m-%d %H:%M:%S} to {from_posix(tb):%Y-%m-%d %H:%M:%S} UTC  |  "
+                 f"{len(sel)} files" + ("  |  DATA_FILES" if DATA_FILES else "") + "\n")
+        fh.write(f"files   {sel[0][1]:%Y-%m-%d %H:%M:%S} to {sel[-1][1]:%Y-%m-%d %H:%M:%S} UTC (start times), "
+                 f"nominal file length {file_sec:g} s\n")
+        fh.write("=" * 100 + "\n\n")
+        db = db_load("meta")
+        for i, (p, ts) in enumerate(sel, 1):
+            n, size = os.path.basename(p), os.path.getsize(p)
+            e = db.get(n)
+            if e is not None and e.get("src_size") == size and "! cannot read" not in e.get("text", ""):
+                txt = e["text"]
+            else:
+                txt = file_metadata_text(p, ts)
+                db[n] = {"src_size": size, "text": txt}
+                _db["dirty"].add("meta")
+            fh.write(txt + "\n")
+            if i % 200 == 0:
+                log(f"  metadata [{i}/{len(sel)}] files")
+    db_save()
+    log(f"  metadata of the {len(sel)} files of the window: {path}  ({time.time() - t0:.0f} s)")
+
+
+def check_layouts(sel):
+    ref = None
+    for p, _ in sel:
+        try:
+            L = layout_of(p)
+        except Exception as e:
+            _report["skipped"][os.path.basename(p)] = f"cannot read the layout: {e}"
+            continue
+        key = (L["fs"], L["dx"], L["n_ch"], L["gauge_m"])
+        if ref is None:
+            ref = key
+        elif key != ref:
+            _report["layout_changes"][os.path.basename(p)] = (f"fs {L['fs']:g} Hz, dx {L['dx']:g} m, {L['n_ch']} channels, "
+                                                             f"GL {L['gauge_m']} m (first file: fs {ref[0]:g} Hz, "
+                                                             f"dx {ref[1]:g} m, {ref[2]} channels, GL {ref[3]} m)")
+    if _report["layout_changes"]:
+        log(f"  ! acquisition settings change in {len(_report['layout_changes'])} files: channels are chosen by "
+            f"distance in every file, other sampling rates are resampled (see the report)")
+
+
+def process_channel(stamped, file_sec, ta, tb, dist, fs):
+    import hashlib
+    import json
+    import warnings
+    from math import gcd
+    from scipy.signal import butter, sosfiltfilt
+    nfft, hop = int(NFFT), int(NFFT) - int(NOVERLAP)
+    w_rms = max(1, int(round(RMS_WINDOW_SEC * fs)))
+    n_tot = int(round((tb - ta) * fs))
+    if n_tot < nfft:
+        raise StopRun("the window is shorter than NFFT")
+    n_seg_tot = (n_tot - nfft) // hop + 1
+    max_cols = SPEC_MAX_COLUMNS or int(0.85 * FIG_WIDTH * DPI_SAVE)
+    grp = max(1, int(np.ceil(n_seg_tot / max_cols)))
+    coh_mode = SPEC_MODE == "coherent"
+    kc = 0
+    if coh_mode:
+        grp = max(grp, int(round(coh_avg_sec(tb - ta) * fs / hop)))
+        kc = coh_offset(layout_of(files_between(stamped, file_sec, ta, tb)[0]))
+    dec = max(1, n_tot // max(1, SIGNAL_POINTS))
+    unit_len = (hop * grp) * w_rms // gcd(hop * grp, w_rms)
+    unit_len = unit_len * dec // gcd(unit_len, dec)
+    core = max(1, int(round(BLOCK_MIN * 60.0 * fs / unit_len))) * unit_len
+    if not 0 < F_MIN < F_MAX < fs / 2:
+        raise StopRun(f"need 0 < F_MIN < F_MAX < fs / 2 = {fs / 2:g} Hz")
+    if PAD_SEC * fs < nfft:
+        raise StopRun(f"PAD_SEC must be at least NFFT / fs = {nfft / fs:.1f} s")
+    use_cm = COMMON_MODE == "median"
+    files = [(os.path.basename(p), os.path.getsize(p)) for p in files_between(stamped, file_sec, ta, tb)]
+    key = hashlib.md5(json.dumps(dict(ta=ta, tb=tb, dist=dist, f=[F_MIN, F_MAX, FILTER_ORDER], nfft=nfft, hop=hop,
+                                      grp=grp, rms=w_rms, dec=dec, pad=PAD_SEC, fill=MAX_FILL_SEC, block=core,
+                                      cable=CABLE, cm=[use_cm, CM_N_CHANNELS, CM_DIST_RANGE_M], files=files,
+                                      off=DISTANCE_OFFSET_M, zone=ZONE, mode=SPEC_MODE,
+                                      coh=[COH_SEPARATION_M, COH_AVG_SEC], fs=fs, stack=[int(CHANNEL_STACK), STACK_METHOD],
+                                      step=_step_override, v=7), sort_keys=True).encode()).hexdigest()[:12]
+    rp = os.path.join(CACHE_FOLDER, "results", f"specsig_{key}.npz")
+    for folder in (cache_folders() if USE_CACHE and not _rebuild else []):
+        cand = os.path.join(folder, "results", f"specsig_{key}.npz")
+        if not os.path.exists(cand):
+            continue
+        try:
+            with np.load(cand, allow_pickle=False) as h:
+                res = {k: h[k] for k in h.files}
+            for k, v in json.loads(str(res.get("report", "{}"))).items():
+                _report[k].update(v)
+            log(f"  {dist:g} m: products from the result cache ({cand})")
+            return res
+        except Exception:
+            continue
+    sos = butter(FILTER_ORDER, [F_MIN, F_MAX], btype="bandpass", fs=fs, output="sos")
+    win = np.hanning(nfft)
+    scale = 1.0 / (fs * np.sum(win ** 2))
+    fall = np.fft.rfftfreq(nfft, 1.0 / fs)
+    fm = (fall >= F_MIN) & (fall <= F_MAX)
+    S_cols, S_t, sig, rms, sig_t, rms_t, gaps, long_gaps = [], [], [], [], [], [], [], []
+    chans = set()
+    t_read = time.time()
+    n_blocks = int(np.ceil(n_tot / core))
+    for bi, b0 in enumerate(range(0, n_tot, core), 1):
+        b1 = min(n_tot, b0 + core)
+        tb0, tb1 = ta + b0 / fs, ta + b1 / fs
+        if coh_mode:
+            xs, npad_b, chs = collect(stamped, file_sec, tb0, tb1, dist, fs, use_cm, (0, -kc, kc))
+            x, xl, xr = xs[0], xs[-kc], xs[kc]
+        else:
+            x, npad_b, chs = collect(stamped, file_sec, tb0, tb1, dist, fs, use_cm)
+        chans |= chs
+        c0, c1 = npad_b, npad_b + (b1 - b0)
+        bad = np.isnan(x)
+        long = np.zeros_like(bad)
+        for s0, s1 in contiguous_runs(bad):
+            if (s1 - s0) / fs > MAX_FILL_SEC:
+                long[s0:s1] = True
+        for s0, s1 in contiguous_runs(bad[c0:c1]):
+            (long_gaps if long[c0:c1][s0:s1].all() else gaps).append((tb0 + s0 / fs, tb0 + s1 / fs))
+        if long.all():
+            log(f"  block {bi}/{n_blocks} ({from_posix(tb0):%Y-%m-%d %H:%M}): no data")
+            continue
+        xf = mirror_fill_1d(x, bad)
+        y = sosfiltfilt(sos, xf)
+        lc = long[c0:c1]
+        yc = y[c0:c1].copy()
+        yc[lc] = np.nan
+        nwin = len(yc) // w_rms
+        rms.append(np.sqrt(np.mean(yc[:nwin * w_rms].reshape(nwin, w_rms) ** 2, axis=1)).astype(np.float32))
+        rms_t.append(tb0 + np.arange(nwin) * w_rms / fs)
+        m = len(yc) // dec
+        blk = yc[:m * dec].reshape(m, dec)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            sig.append(np.column_stack([np.nanmin(blk, axis=1), np.nanmax(blk, axis=1)]).astype(np.float32))
+        sig_t.append(tb0 + (np.arange(m) + 0.5) * dec / fs)
+        starts = np.arange(b0, b1, hop)
+        starts = starts[starts + nfft <= n_tot]
+        if starts.size:
+            loc = starts - b0 + c0
+            ok = loc + nfft <= len(xf)
+            loc, starts = loc[ok], starts[ok]
+            idx = loc[:, None] + np.arange(nfft)[None, :]
+            seglong = long[idx].any(axis=1)
+            if coh_mode:
+                seglong = seglong | np.isnan(xl)[idx].any(axis=1) | np.isnan(xr)[idx].any(axis=1)
+                Fl = np.fft.rfft(np.nan_to_num(xl)[idx] * win, axis=1)[:, fm]
+                Fr = np.fft.rfft(np.nan_to_num(xr)[idx] * win, axis=1)[:, fm]
+                P = Fl * np.conj(Fr) * scale * 2.0
+            else:
+                F = np.fft.rfft(xf[idx] * win, axis=1)[:, fm]
+                P = (F.real ** 2 + F.imag ** 2) * scale * 2.0
+            P[seglong] = np.nan
+            ng = len(P) // grp
+            if ng:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    avg = np.nanmean(P[:ng * grp].reshape(ng, grp, -1), axis=1)
+                    S_cols.append((np.abs(avg) if coh_mode else avg).astype(np.float32))
+                S_t.append(ta + (starts[:ng * grp].reshape(ng, grp).mean(axis=1) + nfft / 2.0) / fs)
+        log(f"  block {bi}/{n_blocks} ({from_posix(tb0):%Y-%m-%d %H:%M}) done  ({time.time() - t_read:.0f} s)")
+        del x, xf, y
+    if not S_cols:
+        raise StopRun("no data in the window")
+    res = dict(f=fall[fm], S=np.concatenate(S_cols).T, St=np.concatenate(S_t), sig=np.concatenate(sig),
+               sig_t=np.concatenate(sig_t), rms=np.concatenate(rms), rms_t=np.concatenate(rms_t), nfft=nfft,
+               fs=fs, gaps=np.array(gaps).reshape(-1, 2), long_gaps=np.array(long_gaps).reshape(-1, 2),
+               chans=np.array(sorted(chans), dtype=float).reshape(-1, 3),
+               report=json.dumps({k: _report[k] for k in ("skipped", "notes", "fs_changes")}))
+    log(f"  {dist:g} m: processed in {time.time() - t_read:.0f} s; spectrogram {res['S'].shape[1]} columns")
+    if USE_CACHE:
+        try:
+            os.makedirs(os.path.dirname(rp), exist_ok=True)
+            with open(rp + ".tmp", "wb") as fh:
+                np.savez(fh, **res)
+            os.replace(rp + ".tmp", rp)
+        except OSError as e:
+            log(f"  ! cannot write the result cache ({e})")
+    return res
+
+
+def time_axis(ax, ta, total):
+    if total <= 2 * 86400:
+        ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda s, _: from_posix(ta + s).strftime("%H:%M")))
+        return
+    for step in (21600, 43200, 86400, 2 * 86400, 7 * 86400, 14 * 86400):
+        if total / step <= 10:
+            break
+    first = np.ceil(ta / step) * step - ta
+    ax.xaxis.set_major_locator(plt.FixedLocator(np.arange(first, total + 1, step)))
+    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda s, _: from_posix(ta + s).strftime("%m-%d %H:%M")))
+
+
+def plot_channel(res, dist, L, ta, tb):
+    f, St = res["f"], res["St"]
+    unit, k = unit_scale()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        Sdb = 10.0 * np.log10(res["S"].astype(np.float64) * k * k)
+    cb_label = (f"Coherent PSD (dB re 1 ({unit})\u00b2/Hz)" if SPEC_MODE == "coherent"
+                else f"PSD (dB re 1 ({unit})\u00b2/Hz)")
+    if SPEC_NORMALISE == "rolling":
+        from scipy.ndimage import median_filter
+        dtc = float(np.median(np.diff(St))) if len(St) > 1 else 1.0
+        bg_min = float(SPEC_BG_MIN) if SPEC_BG_MIN else min(360.0, max(5.0, (tb - ta) / 60.0 / 24.0))
+        w = max(3, int(round(bg_min * 60.0 / dtc)) | 1)
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            level = np.nanmedian(Sdb, axis=0)
+        good = np.isfinite(level)
+        if good.any():
+            level = np.interp(np.arange(level.size), np.flatnonzero(good), level[good])
+            level = median_filter(level, size=min(w, level.size | 1), mode="nearest")
+            D1 = Sdb - level[None, :]
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                prof = np.nanmedian(D1, axis=1)
+            prof = np.where(np.isfinite(prof), prof, np.nanmedian(prof))
+            nsm = max(3, int(round(5.0 / max(f[1] - f[0], 1e-9))) | 1)
+            prof = median_filter(prof, size=min(nsm, prof.size | 1), mode="nearest")
+            Sdb = D1 - prof[:, None]
+        cb_label = f"PSD above the background (dB; {bg_min:g}-min broadband level and spectral slope removed)"
+    elif SPEC_NORMALISE == "time":
+        Sdb = Sdb - np.nanmedian(Sdb, axis=0, keepdims=True)
+        cb_label = "PSD relative to the median of each time column (dB)"
+    elif SPEC_NORMALISE == "frequency":
+        Sdb = Sdb - np.nanmedian(Sdb, axis=1, keepdims=True)
+        cb_label = "PSD relative to the median of each frequency (dB)"
+    ok = np.isfinite(Sdb)
+    clim = tuple(SPEC_CLIM_DB) if SPEC_CLIM_DB else (float(np.percentile(Sdb[ok], SPEC_CLIM_PCT[0])),
+                                                     float(np.percentile(Sdb[ok], SPEC_CLIM_PCT[1])))
+    if SPEC_NORMALISE == "rolling" and not SPEC_CLIM_DB:
+        clim = (min(clim[0], -3.0), max(clim[1], 6.0))
+    sig, rms = res["sig"].astype(np.float64) * k, res["rms"].astype(np.float64) * k
+    rms_t = res["rms_t"]
+    if len(rms) > RMS_PLOT_POINTS:
+        n = int(np.ceil(len(rms) / RMS_PLOT_POINTS))
+        m = len(rms) // n
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            rms = np.nanmax(rms[:m * n].reshape(m, n), axis=1)
+        rms_t = rms_t[:m * n].reshape(m, n)[:, 0]
+    q = float(YLIM_PERCENTILE or 100.0)
+    mg = float(YLIM_MARGIN or 1.0)
+    sig_lim = float(SIGNAL_YLIM) if SIGNAL_YLIM else nice_limit(mg * np.nanpercentile(np.abs(sig), q))
+    rms_lim = float(RMS_YLIM) if RMS_YLIM else nice_limit(mg * np.nanpercentile(rms, q))
+    total = tb - ta
+    chs = res["chans"]
+    ch0 = int(chs[0][0]) if len(chs) else int(round((dist - x0_of(L)) / L["dx"]))
+    gls = sorted({round(float(c[2]), 2) for c in chs if np.isfinite(c[2]) and c[2] > 0})
+    gl = gls[0] if len(gls) == 1 else (None if not gls else "/".join(f"{g:g}" for g in gls))
+    gl = gl if gl is not None else L.get("gauge_m")
+    ch_txt = f"Channel {ch0}" if len(chs) <= 1 else "Channels " + ", ".join(str(int(c[0])) for c in chs)
+    fig = plt.figure(figsize=(FIG_WIDTH, FIG_HEIGHT))
+    gs = gridspec.GridSpec(3, 2, width_ratios=[1, 0.02], height_ratios=[2.5, 1, 1], hspace=0.06, wspace=0.03)
+    ax_spec, ax_cbar = fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1])
+    ax_sig = fig.add_subplot(gs[1, 0], sharex=ax_spec)
+    ax_rms = fig.add_subplot(gs[2, 0], sharex=ax_spec)
+    fig.add_subplot(gs[1, 1]).set_visible(False)
+    fig.add_subplot(gs[2, 1]).set_visible(False)
+    cmap = matplotlib.colormaps[CMAP_SPEC].copy()
+    cmap.set_bad("white")
+    ts = St - ta
+    dt = ts[1] - ts[0] if len(ts) > 1 else res["nfft"] / res["fs"]
+    df = f[1] - f[0]
+    im = ax_spec.imshow(np.ma.masked_invalid(Sdb), origin="lower", aspect="auto", cmap=cmap, vmin=clim[0],
+                        vmax=clim[1], interpolation="antialiased",
+                        extent=[ts[0] - dt / 2, ts[-1] + dt / 2, f[0] - df / 2, f[-1] + df / 2])
+    ax_spec.set_ylim(F_MIN, F_MAX)
+    ax_spec.set_ylabel("Frequency (Hz)", fontsize=10)
+    ax_spec.grid(False)
+    plt.setp(ax_spec.xaxis.get_majorticklabels(), visible=False)
+    plt.colorbar(im, cax=ax_cbar)
+    ax_cbar.set_ylabel(cb_label, fontsize=9)
+    end_fmt = "%H:%M:%S" if from_posix(tb).date() == from_posix(ta).date() else "%Y-%m-%d %H:%M:%S"
+    ax_spec.set_title(f"{ch_txt}  (Optical Position: {dist:.1f} m)  |  {F_MIN:.0f}\u2013{F_MAX:.0f} Hz  |  "
+                      + (f"GL = {gl} m" if isinstance(gl, str) else (f"GL = {gl:.1f} m" if gl else "GL = n/a"))
+                      + ("  |  common mode removed" if COMMON_MODE == "median" else "")
+                      + (f"  |  {int(CHANNEL_STACK)}-channel {STACK_METHOD}" if int(CHANNEL_STACK) > 1 else "")
+                      + (f"  |  coherent spectrogram (channels \u00b1{coh_offset(L)}, {coh_avg_sec(tb - ta):g} s)"
+                         if SPEC_MODE == "coherent" else "")
+                      + f"\n{from_posix(ta):%Y-%m-%d %H:%M:%S} UTC to {from_posix(tb).strftime(end_fmt)} UTC",
+                      fontsize=10, pad=6)
+    tt = np.repeat(res["sig_t"] - ta, 2)
+    ax_sig.plot(tt, sig.ravel(), linewidth=0.3, color="steelblue", alpha=0.9, clip_on=True, rasterized=True)
+    ax_sig.set_ylabel(f"Strain rate ({unit})", fontsize=10)
+    ax_sig.set_xlim(0, total)
+    ax_sig.set_ylim(-sig_lim, sig_lim)
+    ax_sig.axhline(0, color="gray", linewidth=0.4, linestyle="--", alpha=0.5)
+    ax_sig.grid(True, ls="--", alpha=0.25)
+    plt.setp(ax_sig.xaxis.get_majorticklabels(), visible=False)
+    ax_rms.plot(rms_t - ta, rms, linewidth=0.8, color="darkorange", alpha=0.9, clip_on=True, rasterized=True)
+    ax_rms.set_ylabel(f"RMS Strain rate ({unit})", fontsize=10)
+    ax_rms.set_xlabel("Time (UTC)", fontsize=10)
+    ax_rms.set_xlim(0, total)
+    ax_rms.set_ylim(0, rms_lim)
+    ax_rms.grid(True, ls="--", alpha=0.25)
+    time_axis(ax_rms, ta, total)
+    plt.setp(ax_rms.xaxis.get_majorticklabels(), rotation=45, ha="right")
+    ax_rms.annotate(f"window = {RMS_WINDOW_SEC:g} s  |  y-limit = {rms_lim:g} {unit}", xy=(0.01, 0.92),
+                    xycoords="axes fraction", fontsize=8, color="gray")
+    if SHADE_GAPS:
+        for a_, b_ in res["long_gaps"]:
+            for ax in (ax_sig, ax_rms):
+                ax.axvspan(a_ - ta, b_ - ta, color="0.85", lw=0, zorder=0)
+        for a_, b_ in res["gaps"]:
+            if b_ - a_ >= SHADE_FILLED_MIN_SEC:
+                for ax in (ax_sig, ax_rms):
+                    ax.axvspan(a_ - ta, b_ - ta, color="0.93", lw=0, zorder=0)
+    for ax, label in ((ax_spec, "Spectrogram"), (ax_sig, "Strain rate"), (ax_rms, "RMS")):
+        ax.annotate(label, xy=(-0.075, 0.5), xycoords="axes fraction", fontsize=9, fontweight="bold",
+                    color="dimgray", ha="center", va="center", rotation=90)
+    tag = f"Ch{ch0}" if len(chs) <= 1 else "Ch" + "-".join(str(int(c[0])) for c in chs)
+    path = next_path(f"Combined_{CABLE}_{WINDOW_NAME}_{tag}_Pos{dist:.0f}m_{F_MIN:.0f}-{F_MAX:.0f}Hz_strainrate", "jpeg")
+    fig.savefig(path, format="jpeg", dpi=DPI_SAVE, bbox_inches="tight",
+                pil_kwargs={"quality": int(min(95, max(1, JPEG_QUALITY))), "optimize": True})
+    plt.close(fig)
+    log(f"  spectrogram {clim[0]:.1f} to {clim[1]:.1f} dB, signal y-limit {sig_lim:g}, RMS y-limit {rms_lim:g} {unit}")
+    log(f"  saved: {path}  ({os.path.getsize(path) / 1e6:.1f} MB)")
+
+
+def compare_reference(path):
+    def table(q):
+        with open_h5(q) as f:
+            rows = h5_attr_table(f)
+        out = {}
+        for o, k, v in rows:
+            key = re.sub(r"/[^/]*?Zone\d+", "/Zone", re.sub(r"^/[^/]+", "", o)) + "@" + str(k)
+            out[key] = str(v).replace("\n", " ")[:200]
+        return out
+    a, b = table(path), table(REFERENCE_FILE)
+    tlike = re.compile(r"time|date|stamp|count|index", re.I)
+    diff = [(k, a.get(k, "(missing)"), b.get(k, "(missing)")) for k in sorted(set(a) | set(b))
+            if a.get(k) != b.get(k) and not tlike.search(k.split("@")[-1])]
+    La, Lb = layout_of(path), layout_of(REFERENCE_FILE)
+    derived = [(n, La.get(n), Lb.get(n)) for n in ("fs", "dx", "n_ch", "gauge_m", "dt_s", "spb", "x0", "dataset")
+               if La.get(n) != Lb.get(n)]
+    log(f"\n  COMPARISON with REFERENCE_FILE {os.path.basename(REFERENCE_FILE)}")
+    for n, x, y in derived:
+        log(f"    {n:10s}: this window {x}  |  reference {y}")
+    for k, x, y in diff[:40]:
+        log(f"    {k}: this window {x}  |  reference {y}")
+    if not derived and not diff:
+        log("    no difference in the acquisition attributes")
+    elif len(diff) > 40:
+        log(f"    ... {len(diff) - 40} more differences in the report")
+    _report["ref"] = {"file": os.path.basename(REFERENCE_FILE), "derived": derived, "diff": diff}
+
+
+def write_report(sel, excl, ta, tb, results):
+    lines = [f"FEBUS A1-R RUN REPORT  |  cable {CABLE}  |  {DATA_FOLDER}",
+             f"window {from_posix(ta):%Y-%m-%d %H:%M:%S} to {from_posix(tb):%Y-%m-%d %H:%M:%S} UTC  "
+             f"({(tb - ta) / 3600:.2f} h)", ""]
+    sk = _report["skipped"]
+    lines.append(f"FILES: {len(sel)} in the window, {len(sel) - len([s for s in sel if os.path.basename(s[0]) in sk])} used, "
+                 f"{len([s for s in sel if os.path.basename(s[0]) in sk])} could not be read")
+    for n, why in sorted(sk.items()):
+        lines.append(f"  NOT READ  {n}: {why}")
+    for n, why in sorted(excl.items()):
+        lines.append(f"  EXCLUDED  {n}: {why}")
+    if not sk and not excl:
+        lines.append("  every h5 file of the window was read")
+    for n, why in sorted(_report["notes"].items()):
+        lines.append(f"  NOTE      {n}: {why}")
+    runs = []
+    for n, why in sorted(_report["layout_changes"].items()):
+        if runs and runs[-1][2] == why:
+            runs[-1][1], runs[-1][3] = n, runs[-1][3] + 1
+        else:
+            runs.append([n, n, why, 1])
+    for n0, n1, why, cnt in runs:
+        lines.append(f"  SETTINGS  {n0} ... {n1} ({cnt} files): {why}")
+    for n, why in sorted(_report["fs_changes"].items()):
+        lines.append(f"  RESAMPLED {n}: {why}")
+    lines.append("")
+    for dist, res in results:
+        lg, sg = res["long_gaps"], res["gaps"]
+        lines.append(f"DATA at {dist:g} m: channels used {', '.join(str(int(c[0])) for c in res['chans'])}")
+        lines.append(f"  missing data (no samples, longer than {MAX_FILL_SEC:g} s): {len(lg)} intervals, "
+                     f"{float(np.sum(lg[:, 1] - lg[:, 0])) if len(lg) else 0.0:.1f} s")
+        for a_, b_ in lg[:200]:
+            lines.append(f"    {from_posix(a_):%Y-%m-%d %H:%M:%S} to {from_posix(b_):%H:%M:%S}  ({b_ - a_:.1f} s)")
+        lines.append(f"  bridged (no recorded data, filled with mirrored neighbouring data, <= {MAX_FILL_SEC:g} s): "
+                     f"{len(sg)} intervals, {float(np.sum(sg[:, 1] - sg[:, 0])) if len(sg) else 0.0:.1f} s")
+        for a_, b_ in sg:
+            if b_ - a_ >= SHADE_FILLED_MIN_SEC:
+                lines.append(f"    {from_posix(a_):%Y-%m-%d %H:%M:%S} to {from_posix(b_):%H:%M:%S}  ({b_ - a_:.1f} s)")
+    dg = _report["cm"]
+    if dg:
+        lines += ["", "DIAGNOSIS"]
+        for r in dg["block"]:
+            lines.append(f"  block joins {r['file']}: {r['spb']} samples per block, step from time stamps {r['nk_time']}, "
+                         f"from overlap data {r['best']} (match {r['r_best']:.3f}, at time-stamp step {r['r_time']:.3f})")
+        lines.append(f"  block step used: {_step_override if _step_override else 'from the time stamps'}")
+        for c in dg["coh"]:
+            lines.append(f"  {c['file']}: {F_MIN:g}-{F_MAX:g} Hz RMS {c['rms']:.4g} nstrain/s")
+        cs_ = dg.get("coh_summary")
+        if cs_:
+            lines.append(f"  coherence (strongest frequency in {F_MIN:g}-{F_MAX:g} Hz, {cs_['nseg']} pieces) with channels "
+                         f"{cs_['k']} away {cs_['near']:.3f}, with a channel ~100 m away {cs_['far']:.3f}; "
+                         f"noise-only level below {cs_['thr']:.3f}")
+        for n, v in dg["cm"]:
+            lines.append(f"  {n}: share of power common to the whole fibre {100 * v:.0f} %")
+    sc = _report.get("scan")
+    if sc:
+        lines += ["", f"FIBRE SCAN ({sc['file']}): stretches with ground signal: "
+                  + (", ".join(f"{a_:.0f}-{b_:.0f} m" for a_, b_ in sc["runs"]) if sc["runs"] else "none")]
+        for d, c in sc["at"].items():
+            lines.append(f"  {d:g} m: coherence {c:.2f}")
+    sc = _report.get("scan")
+    if sc and "spread" in sc:
+        lines.append(f"  level along the fibre (90th / 10th percentile): {sc['spread']:.2f}"
+                     + ("  -> same everywhere: instrument noise" if sc["spread"] < 1.3 else ""))
+        if not sc["runs"]:
+            lines.append("  CONCLUSION: no stretch shows ground signal in this window; the recording holds instrument noise only")
+    rf = _report.get("ref")
+    if rf:
+        lines += ["", f"ACQUISITION COMPARED WITH {rf['file']}:"]
+        for n, x, y in rf["derived"]:
+            lines.append(f"  {n}: this window {x} | reference {y}")
+        for k, x, y in rf["diff"]:
+            lines.append(f"  {k}: this window {x} | reference {y}")
+        if not rf["derived"] and not rf["diff"]:
+            lines.append("  no difference")
+    path = next_path(f"report_{CABLE}_{WINDOW_NAME}", "txt")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    log(f"  report: {path}")
+
+
+def main():
+    global _rebuild
+    ap = argparse.ArgumentParser(description="Febus A1-R spectrogram, strain-rate signal and RMS")
+    ap.add_argument("--start")
+    ap.add_argument("--end")
+    ap.add_argument("--folder")
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--inspect")
+    ap.add_argument("--rebuild", action="store_true")
+    a, _ = ap.parse_known_args()
+    _rebuild = bool(a.rebuild)
+    if a.inspect:
+        inspect_file(a.inspect)
+        return
+    check_settings()
+    folder = a.folder or DATA_FOLDER
+    stamped, file_sec = list_files(folder, CABLE, RECURSIVE)
+    if DATA_FILES:
+        names = {os.path.basename(n) for n in DATA_FILES}
+        stamped = [r for r in stamped if os.path.basename(r[0]) in names]
+        if not stamped:
+            raise StopRun("none of DATA_FILES was found in DATA_FOLDER")
+    if a.list:
+        describe_coverage(stamped, file_sec, CABLE)
+        return
+    t_start = parse_window_time(a.start or START_TIME)
+    t_end = parse_window_time(a.end or END_TIME)
+    if t_end <= t_start:
+        raise StopRun("END_TIME is before START_TIME")
+    ta, tb = to_posix(t_start), to_posix(t_end)
+    log(f"\n{t_start:%Y-%m-%d %H:%M:%S} -> {t_end:%Y-%m-%d %H:%M:%S} UTC  ({(tb - ta) / 3600:.2f} h)  |  cable {CABLE}")
+    check_window(stamped, file_sec, ta, tb)
+    sel = window_files(stamped, file_sec, ta, tb)
+    if not sel:
+        raise StopRun("no files in the window")
+    excl = excluded_files(folder, stamped, file_sec, ta, tb)
+    log(f"  {len(sel)} files in the window: {os.path.basename(sel[0][0])} ... {os.path.basename(sel[-1][0])}")
+    for n, why in sorted(excl.items()):
+        log(f"  ! {n} is in the window but not used: {why}")
+    t_list = np.array([to_posix(ts) for _, ts in sel])
+    holes = [(t_list[i] + file_sec, t_list[i + 1]) for i in range(len(t_list) - 1) if t_list[i + 1] - t_list[i] > 1.5 * file_sec]
+    for h0, h1 in holes:
+        log(f"  ! no file between {from_posix(h0):%Y-%m-%d %H:%M:%S} and {from_posix(h1):%H:%M:%S} UTC")
+    small = [(p, os.path.getsize(p)) for p, _ in sel]
+    full = float(np.median([z for _, z in small]))
+    for p, z in small:
+        if z < 0.9 * full:
+            log(f"  ! {os.path.basename(p)} is {z / 1e6:.1f} MB (most files {full / 1e6:.1f} MB): it holds about "
+                f"{file_sec * z / full:.0f} s of data")
+    if SAVE_METADATA:
+        save_metadata(sel, file_sec, ta, tb)
+    check_layouts(sel)
+    db_save()
+    L = layout_of(sel[0][0])
+    log(f"  first file: fs {L['fs']:g} Hz, dx {L['dx']:g} m, {L['n_ch']} channels, "
+        + (f"GL {L['gauge_m']:g} m" if L.get("gauge_m") else "GL not found") + f"  ({os.path.basename(sel[0][0])})")
+    log(f"  data set {L['dataset']}  (" + (f"{L['unit_kind']}" if L.get("unit_kind") else "unit not recognised")
+        + f"), zone {L['zone']}" + (f" of {L['zones']}" if ";" in str(L.get("zones", "")) else ""))
+    log(f"  channel 0 of the data is at {x0_of(L):g} m ("
+        + ("DISTANCE_OFFSET_M" if DISTANCE_OFFSET_M is not None else L.get("x0_src", "?"))
+        + f"), the data cover {x0_of(L):g}-{x0_of(L) + (L['n_ch'] - 1) * L['dx']:g} m")
+    if L.get("unit_kind") and L["unit_kind"] != "strain_rate":
+        log(f"  ! the data set holds {L['unit_kind']}, not strain rate: the labels would be wrong")
+    fs = L["fs"]
+    targets = targets_from_settings(L)
+    global _step_override
+    if isinstance(BLOCK_STEP, int):
+        _step_override = int(BLOCK_STEP)
+    if REFERENCE_FILE:
+        try:
+            if not os.path.isfile(REFERENCE_FILE):
+                raise ValueError(f"not found: {REFERENCE_FILE}")
+            compare_reference(sel[0][0])
+        except Exception as e:
+            log(f"  ! comparison with REFERENCE_FILE failed: {e}")
+    if FIBRE_SCAN:
+        try:
+            fibre_scan(sel, targets)
+        except Exception as e:
+            log(f"  ! fibre scan failed: {e}")
+    if DIAGNOSE:
+        _report["cm"] = diagnose(sel, targets[0], fs)
+    results = []
+    for dist in targets:
+        log(f"\n  {dist:g} m")
+        try:
+            res = process_channel(stamped, file_sec, ta, tb, dist, fs)
+            plot_channel(res, dist, L, ta, tb)
+            results.append((dist, res))
+        except StopRun as e:
+            log(f"  {dist:g} m skipped: {e}")
+    if _report["skipped"]:
+        log(f"\n  ! {len(_report['skipped'])} files could not be read (see the report)")
+    if SAVE_REPORT:
+        write_report(sel, excl, ta, tb, results)
+    db_save()
+    c = _cache_stats
+    log(f"\n  cache: {c['hit']} channel reads from the cache, {c['built']} new  |  h5 files opened this run: "
+        f"{len(_h5_opened)}" + ("  (0 = everything came from the cache)" if not _h5_opened else
+                                f"  (window: {len(sel)} files, plus neighbours for the filter edges)"))
+    log("\nDone.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except StopRun as stop:
+        print(f"\nSTOPPED: {stop}")
