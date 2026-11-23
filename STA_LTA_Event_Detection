@@ -1,0 +1,1934 @@
+Author: Gizem Karslioglu
+import os
+import re
+import io
+import glob
+import gzip
+import json
+import math
+import argparse
+import datetime
+import warnings
+import functools
+from fractions import Fraction
+
+os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
+
+import numpy as np
+import h5py
+from scipy.signal import resample_poly, butter, sosfiltfilt, correlate, correlation_lags
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.patches import Patch
+from matplotlib.lines import Line2D
+
+START_TIME           = "2025-07-18 17:35:00"
+END_TIME             = "2025-07-18 18:05:00"
+DURATION_MIN         = 30.0
+MAX_WINDOW_HOURS     = 6.0
+SEIS_NAME_MARGIN_H   = 24.0
+CACHE_FOLDER         = None
+
+DAS_FORMAT           = "auto"
+DAS_FOLDER           = r"/Volumes/X9ProII/CH1"
+DAS_PATTERN          = ["*.h5", "*.H5", "*.hdf5"]
+DAS_RECURSIVE        = True
+DAS_REF_CHANNEL      = 149
+DAS_REF_DISTANCE_M   = None
+DAS_FS_HZ            = None
+DAS_GAUGE_LENGTH_M   = None
+DAS_DX_M             = None
+DAS_MERGE_TOL_SEC    = 0.02
+DAS_NAN_MAX_FILL_SEC = 0.5
+
+FEBUS_ZONE           = None
+FEBUS_DATASET        = None
+FEBUS_UNITS          = {"strainrate": ("strain_rate", 1e-9), "sr": ("strain_rate", 1e-9),
+                        "strain": ("strain", 1e-9),
+                        "phaserate": ("phase_rate", 1.0), "phase": ("phase", 1.0)}
+FEBUS_DEFAULT_UNIT   = None
+
+RAW_DATASET_PATHS    = ["/Acquisition/Raw[0]/RawData", "/RawData", "RawData"]
+SINTELA_UNIT         = "phase"
+PHASE_WRAPPED        = "auto"
+
+SEIS_FOLDER          = r"/Volumes/X9ProII/EPIC_ST01-ST04_July2025/ST02/converted_mseed"
+SEIS_PATTERN         = "*"
+SEIS_RECURSIVE       = True
+SEIS_NETWORK         = "*"
+SEIS_STATION         = "ST02"
+SEIS_LOCATION        = "*"
+SEIS_CHANNELS        = "*"
+SEIS_STATION_ALIASES = []
+SEIS_MATCH_FILENAME  = True
+SEIS_MIN_FS_HZ       = 20.0
+RESPONSE_FILES       = [r"/Volumes/X9ProII/EPIC_ST01-ST04_July2025/ST02/ST02_*.xml"]
+SEIS_COMPONENT_MAP   = None
+SEIS_H1_AZIMUTH_DEG  = 0.0
+SEIS_TIME_SHIFT_SEC  = 0.0
+SEIS_WATER_LEVEL_DB  = 60.0
+SEIS_PREFILT_LO_HZ   = (0.2, 0.4)
+
+STATION_LOCATIONS_FILE = r"/Volumes/X9ProII/EPIC_Station_FiberInstallation/RESESS & GLP BB Station Locations (5).xlsx"
+SEIS_STATION_COORDS  = None
+MAX_STATION_FIBRE_M  = 30.0
+
+FIBRE_CHANNELS_CSV   = r"/Volumes/X9ProII/EPIC_Station_FiberInstallation/out_map/febus_fibre_channels.csv"
+FIBRE_AZIMUTH_DEG    = None
+AZIMUTH_HALF_WIN_M   = 8.0
+SEIS_COMPONENT       = "axial"
+
+NEFF                 = 1.4682
+WAVELENGTH           = 1550.12e-9
+STRAIN_OPTIC_COEFF   = 0.78
+
+COMMON_FS_HZ         = 200.0
+SEG_SEC              = 15.0
+BAND_HZ              = (0.01, 50.0)
+QUANTITY_PAIR        = "strain_rate/acceleration"
+FK_APPARENT_VELOCITY_MPS = 350.0
+FK_VELOCITY_RANGE_MPS = (300.0, 450.0)
+FK_VELOCITY_SOURCE = "Febus EPIC CH1 f-k, 2025-07-18 17:00-19:00 UTC, channels 50-736; approximate ridge over much of 5-20 Hz"
+
+STA_SEC              = 0.5
+LTA_SEC              = 10.0
+TRIGGER_ON           = 4.0
+TRIGGER_OFF          = 1.5
+MIN_EVENT_SEC        = 0.2
+DECLUSTER_SEC        = 2.0
+MATCH_TOL_SEC        = 3.0
+PRE_EVENT_NOISE_SEC  = 10.0
+CC_MAX_LAG_SEC       = 0.5
+CC_MIN_FOR_CLOCK     = 0.7
+
+OUTPUT_FOLDER        = os.path.join(DAS_FOLDER, "output_sta_lta")
+FIG_FORMATS          = ("jpeg",)
+FIGSIZE              = (18.0, 12.5)
+DPI                  = 300
+FONT_TITLE           = 24.0
+FONT_SUBTITLE        = 18.0
+FONT_LABEL           = 16.0
+FONT_TICK            = 14.0
+FONT_LEGEND          = 15.0
+COLOR_DAS            = "#D55E00"
+COLOR_SEIS           = "#0072B2"
+COLOR_COMMON         = "#009E73"
+COLOR_OFF            = "#E69F00"
+WAVE_LINEWIDTH       = 0.7
+WAVE_CLIP_PERCENTILE = 100.0
+LABEL_EVENTS_MAX     = 40
+GALLERY_MAX          = 12
+GALLERY_NCOLS        = 3
+GALLERY_PRE_SEC      = 2.0
+GALLERY_POST_SEC     = 8.0
+
+UTC = datetime.timezone.utc
+
+
+def log(msg=""):
+    print(msg, flush=True)
+
+
+class StopRun(Exception):
+    pass
+
+
+def to_posix(dt):
+    return dt.replace(tzinfo=UTC).timestamp()
+
+
+def utc_text(t, fmt="%Y-%m-%d %H:%M:%S"):
+    return datetime.datetime.fromtimestamp(float(t), tz=UTC).strftime(fmt)
+
+
+def filename_time(name):
+    m = re.search(r"(\d{4})\W(\d{2})\W(\d{2})[_T\s](\d{2})\W(\d{2})\W(\d{2})(?:[.,](\d{1,6}))?_?UTC", name)
+    if not m:
+        return None
+    g = m.groups()
+    us = int((g[6] or "0").ljust(6, "0")[:6])
+    return to_posix(datetime.datetime(*[int(x) for x in g[:6]], us))
+
+
+def epoch_seconds(t):
+    t = np.asarray(t, dtype=np.float64).ravel()
+    if not t.size or not np.isfinite(t[0]):
+        return None
+    a = abs(t[0])
+    for lim, f in ((1e17, 1e-9), (1e14, 1e-6), (1e11, 1e-3), (1e8, 1.0)):
+        if a >= lim:
+            return t * f
+    return None
+
+
+def h5_attrs(f):
+    out = {}
+
+    def visit(name, obj):
+        for k, v in obj.attrs.items():
+            out[f"/{name}/{k}".lower()] = v
+    f.visititems(visit)
+    for k, v in f.attrs.items():
+        out[f"/{k}".lower()] = v
+    return out
+
+
+def attr_num(attrs, names):
+    for n in names:
+        for k, v in attrs.items():
+            if k.endswith("/" + n.lower()):
+                try:
+                    if isinstance(v, (bytes, np.bytes_)):
+                        v = v.decode("utf-8", "ignore")
+                    if isinstance(v, str):
+                        m = re.match(r"\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)", v)
+                        if m:
+                            return float(m.group(1))
+                        continue
+                    return float(np.ravel(v)[0])
+                except (TypeError, ValueError, IndexError):
+                    continue
+    return None
+
+
+def _vec(attrs, name, default=None):
+    if name not in attrs:
+        return None if default is None else np.atleast_1d(np.asarray(default, np.float64)).ravel()
+    v = attrs[name]
+    if isinstance(v, (bytes, np.bytes_, str)):
+        try:
+            v = float(v.decode() if isinstance(v, (bytes, np.bytes_)) else v)
+        except ValueError:
+            return None if default is None else np.atleast_1d(np.asarray(default, np.float64)).ravel()
+    return np.atleast_1d(np.asarray(v, np.float64)).ravel()
+
+
+def febus_unit(name):
+    key = re.sub(r"[^a-z]", "", name.split("[")[0].lower())
+    if key in FEBUS_UNITS:
+        return FEBUS_UNITS[key]
+    for k in sorted(FEBUS_UNITS, key=len, reverse=True):
+        if key.startswith(k):
+            return FEBUS_UNITS[k]
+    return FEBUS_DEFAULT_UNIT
+
+
+def febus_find(f):
+    skipped = []
+    for gname in f:
+        g = f[gname]
+        if not isinstance(g, h5py.Group):
+            continue
+        for sname in g:
+            s = g[sname]
+            if not isinstance(s, h5py.Group) or "time" not in s:
+                continue
+            for zname in s:
+                z = s[zname]
+                if zname == "time" or not isinstance(z, h5py.Group):
+                    continue
+                if FEBUS_ZONE and zname != FEBUS_ZONE:
+                    continue
+                for dname in z:
+                    ds = z[dname]
+                    if not (isinstance(ds, h5py.Dataset) and ds.ndim == 3):
+                        continue
+                    if FEBUS_DATASET and dname.lower() != FEBUS_DATASET.lower():
+                        continue
+                    if febus_unit(dname) is None:
+                        skipped.append(dname)
+                        continue
+                    return s, z, ds
+    if skipped:
+        raise StopRun(f"Febus dataset(s) {skipped} are not a recognised time series (e.g. PSD products); "
+                      f"set FEBUS_DATASET and FEBUS_DEFAULT_UNIT if one of them is")
+    return None
+
+
+def febus_layout(path, f, hit):
+    s, z, ds = hit
+    za = z.attrs
+    n_blk, n_pad, n_ch = (int(v) for v in ds.shape)
+    spacing = _vec(za, "Spacing")
+    if spacing is None or len(spacing) < 2:
+        raise StopRun(f"Febus zone {z.name} has no Spacing attribute")
+    origin = _vec(za, "Origin", [0.0, 0.0])
+    extent = _vec(za, "Extent", [0, n_ch - 1, 0, n_pad - 1])
+    tv = epoch_seconds(np.asarray(s["time"][...], np.float64).ravel())
+    if tv is None:
+        raise StopRun(f"Febus time vector in {os.path.basename(path)} is not an epoch time")
+    if DAS_FS_HZ:
+        dt = 1.0 / DAS_FS_HZ
+    elif "Version" in za:
+        dt = float(spacing[1]) / 1000.0
+    else:
+        fz = _vec(za, "SamplingRate")
+        dt = 1.0 / float(fz[0]) if fz is not None and 0 < fz[0] < 1e8 else float(spacing[1]) / 1000.0
+    br = _vec(za, "BlockRate", [0.0])[0] / 1000.0
+    d_tv = np.diff(tv)
+    if br > 0:
+        block_time, bt_src = 1.0 / br, "BlockRate"
+    elif len(d_tv) and np.any(d_tv > 0):
+        good = d_tv[(d_tv > 0) & (d_tv < 1.5 * np.median(d_tv[d_tv > 0]))]
+        block_time, bt_src = float(np.mean(good)), "time vector"
+    else:
+        block_time, bt_src = None, None
+    ov_attr = _vec(za, "Overlap", None)
+    ov_attr = ov_attr if ov_attr is not None else _vec(za, "BlockOverlap", None)
+    if block_time is not None:
+        keep = int(round(block_time / dt))
+    else:
+        ov = float(ov_attr[0]) if ov_attr is not None else 0.0
+        keep = int(round(n_pad / (1 + ov / 100.0)))
+        block_time = keep * dt
+    if n_pad < keep <= 1.03 * n_pad:
+        keep = n_pad
+    if keep > n_pad:
+        log(f"  ! {os.path.basename(path)}: block period {block_time:g} s holds {keep} samples, the blocks only "
+            f"{n_pad}: the blocks are not contiguous, gaps stay empty")
+        keep = n_pad
+    keep = max(1, keep)
+    q, r = divmod(n_pad - keep, 2)
+    i0, i1 = q, n_pad - 1 - (q + r)
+    n_keep = i1 - i0 + 1
+    if ov_attr is not None and n_pad > keep and block_time is not None:
+        ov_expect = 100.0 * (n_pad - keep) / keep
+        if abs(ov_expect - float(ov_attr[0])) > 1.5:
+            log(f"  ! {os.path.basename(path)}: BlockOverlap {float(ov_attr[0]):g} % but {n_pad} samples per block "
+                f"of {block_time:g} s imply {ov_expect:.1f} %; using the block period")
+    t_off = float(origin[1]) / 1000.0 if len(origin) > 1 else 0.0
+    if len(tv) == n_blk:
+        tb = tv + t_off + i0 * dt
+    else:
+        tb = tv[0] + t_off + i0 * dt + np.arange(n_blk) * n_keep * dt
+    step = n_keep * dt
+    runs, b0 = [], 0
+    for b in range(1, n_blk):
+        if abs(tb[b] - (tb[b0] + (b - b0) * step)) > 0.5 * step:
+            runs.append((b0, b, float(tb[b0])))
+            b0 = b
+    runs.append((b0, n_blk, float(tb[b0])))
+    fs = float(f"{1.0 / dt:.9g}")
+    gl_attr = _vec(za, "GaugeLength")
+    gl = DAS_GAUGE_LENGTH_M or (float(gl_attr[0]) if gl_attr is not None else None)
+    dx = DAS_DX_M or float(spacing[0])
+    kind, scale = febus_unit(ds.name.rsplit("/", 1)[-1])
+    return dict(format="febus", path=path, dataset=ds.name, n_t=n_blk * n_keep, n_ch=n_ch, fs=fs,
+                gauge=gl, dx=dx, dist0=float(origin[0]) + float(extent[0]) * dx, t0=runs[0][2],
+                t1=runs[-1][2] + (runs[-1][1] - runs[-1][0]) * step, kind=kind, scale=scale,
+                febus=dict(i0=i0, i1=i1, n_keep=n_keep, n_pad=n_pad, runs=runs, block_time=block_time,
+                           block_time_src=bt_src, zone=z.name))
+
+
+def sintela_layout(path, f):
+    ds = next((f[p] for p in RAW_DATASET_PATHS if p in f and isinstance(f[p], h5py.Dataset)), None)
+    if ds is None:
+        return None
+    attrs = h5_attrs(f)
+    dims = str(attrs.get(f"{ds.name}/dimensions".lower(), "")).lower()
+    time_axis = 1 if dims.strip("[]'\" b").startswith(("locus", "loci", "channel", "distance")) else 0
+    n_t, n_ch = (ds.shape[0], ds.shape[1]) if time_axis == 0 else (ds.shape[1], ds.shape[0])
+    t_s, fs_t = None, None
+    for k in ("RawDataTime", "Time", "time", "Timestamps"):
+        if k in ds.parent and ds.parent[k].size == n_t:
+            tt = ds.parent[k]
+            t_s = epoch_seconds(np.array([tt[0], tt[n_t - 1]], dtype=np.float64))
+            if t_s is not None and n_t > 1 and t_s[1] > t_s[0]:
+                fs_t = (n_t - 1) / float(t_s[1] - t_s[0])
+            break
+    fs_attr = attr_num(attrs, ["OutputDataRate", "SamplingRate", "SampleRate"])
+    fs = DAS_FS_HZ
+    if fs is None:
+        if fs_t and fs_attr and abs(fs_t / fs_attr - 1) < 2e-3:
+            fs = fs_attr
+        else:
+            fs = fs_t or fs_attr or attr_num(attrs, ["PulseRate"])
+    if not fs:
+        raise StopRun("no DAS sampling rate in the file attributes: set DAS_FS_HZ")
+    fs = float(f"{fs:.9g}")
+    gl = DAS_GAUGE_LENGTH_M or attr_num(attrs, ["GaugeLength", "GageLength"])
+    dx = DAS_DX_M or attr_num(attrs, ["SpatialSamplingInterval", "ChannelSpacing"]) or gl
+    if SINTELA_UNIT in ("phase", "phase_rate") and not gl:
+        raise StopRun("no gauge length in the file attributes: set DAS_GAUGE_LENGTH_M")
+    t0 = float(t_s[0]) if t_s is not None else filename_time(os.path.basename(path))
+    if t0 is None:
+        raise StopRun(f"no start time for {os.path.basename(path)}")
+    return dict(format="sintela", path=path, n_t=int(n_t), n_ch=int(n_ch), time_axis=time_axis, fs=fs,
+                gauge=float(gl) if gl else None, dx=float(dx), dist0=0.0, t0=t0, t1=t0 + n_t / fs,
+                dataset=ds.name, kind=SINTELA_UNIT, scale=1.0)
+
+
+@functools.lru_cache(maxsize=None)
+def das_layout(path):
+    with h5py.File(path, "r") as f:
+        if DAS_FORMAT in ("auto", "febus"):
+            hit = febus_find(f)
+            if hit is not None:
+                return febus_layout(path, f, hit)
+            if DAS_FORMAT == "febus":
+                raise StopRun(f"{os.path.basename(path)} is not a Febus A1 DAS file (no Source*/Zone*/<data>)")
+        L = sintela_layout(path, f)
+        if L is None:
+            raise StopRun(f"{os.path.basename(path)}: neither a Febus zone nor a Sintela RawData dataset")
+        return L
+
+
+def read_raw(L, c0, c1, t_lo, t_hi):
+    out = []
+    with h5py.File(L["path"], "r") as f:
+        ds = f[L["dataset"]]
+        if L["format"] == "febus":
+            fb = L["febus"]
+            step = fb["n_keep"] / L["fs"]
+            for b0, b1, ts in fb["runs"]:
+                k0 = max(b0, b0 + int(math.floor((t_lo - ts) / step)))
+                k1 = min(b1, b0 + int(math.ceil((t_hi - ts) / step)))
+                if k1 <= k0:
+                    continue
+                x = ds[k0:k1, fb["i0"]:fb["i1"] + 1, c0:c1]
+                out.append((ts + (k0 - b0) * step, np.asarray(x, np.float64).reshape(-1, c1 - c0)))
+        else:
+            fs = L["fs"]
+            i0 = max(0, int(math.floor((t_lo - L["t0"]) * fs)))
+            i1 = min(L["n_t"], int(math.ceil((t_hi - L["t0"]) * fs)) + 1)
+            if i1 > i0:
+                raw = ds[i0:i1, c0:c1] if L["time_axis"] == 0 else ds[c0:c1, i0:i1].T
+                out.append((L["t0"] + i0 / fs, np.asarray(raw, np.float64)))
+    return out
+
+
+def merge_segments(segs):
+    segs = sorted(segs, key=lambda s: s[0])
+    out, worst = [], 0.0
+    for t0, fs, x, L in segs:
+        if out:
+            pt, pfs, parts, pL, n_prev = out[-1]
+            same = pfs == fs and pL["kind"] == L["kind"]
+            gap = t0 - (pt + n_prev / pfs)
+            if same and gap < -DAS_MERGE_TOL_SEC:
+                k = int(round(-gap * fs))
+                if k >= len(x):
+                    continue
+                x, t0 = x[k:], t0 + k / fs
+                gap = t0 - (pt + n_prev / pfs)
+            if same and abs(gap) <= DAS_MERGE_TOL_SEC:
+                parts.append(x)
+                out[-1] = (pt, pfs, parts, pL, n_prev + len(x))
+                worst = max(worst, abs(gap))
+                continue
+        out.append((t0, fs, [x], L, len(x)))
+    return [(t0, fs, np.concatenate(parts, axis=0), L) for t0, fs, parts, L, _ in out], worst
+
+
+def fill_nans(x, fs):
+    bad = ~np.isfinite(x)
+    if not bad.any():
+        return x, np.zeros(len(x), bool)
+    long_mask = np.zeros(len(x), bool)
+    x = x.copy()
+    n_max = int(round(DAS_NAN_MAX_FILL_SEC * fs))
+    idx = np.arange(len(x))
+    for j in range(x.shape[1]):
+        b = bad[:, j]
+        if not b.any():
+            continue
+        if b.all():
+            long_mask[:] = True
+            x[:, j] = 0.0
+            continue
+        x[b, j] = np.interp(idx[b], idx[~b], x[~b, j])
+        edges = np.flatnonzero(np.diff(np.r_[0, b.astype(int), 0]))
+        for a_, b_ in zip(edges[::2], edges[1::2]):
+            if b_ - a_ > n_max:
+                long_mask[a_:b_] = True
+    return x, long_mask
+
+
+def phase_to_strain():
+    return WAVELENGTH / (4.0 * np.pi * NEFF * STRAIN_OPTIC_COEFF)
+
+
+def ratio(fs_in, fs_out):
+    fr = Fraction(fs_out / fs_in).limit_denominator(1000)
+    return fr.numerator, fr.denominator
+
+
+def to_strain_rate(x, fs, L):
+    kind = L["kind"]
+    x = x * L["scale"]
+    if kind in ("phase", "strain"):
+        d = np.diff(x, axis=0)
+        if kind == "phase":
+            wrapped = PHASE_WRAPPED
+            if wrapped == "auto":
+                wrapped = bool(np.nanmax(np.abs(x)) <= np.pi * 1.0001 and np.nanmax(np.abs(d)) > np.pi)
+            if wrapped:
+                d = (d + np.pi) % (2 * np.pi) - np.pi
+        d = np.concatenate([d[:1], d], axis=0) * fs
+    elif kind in ("strain_rate", "phase_rate"):
+        d = x
+    else:
+        raise StopRun(f"unknown DAS quantity {kind!r}")
+    if kind in ("phase", "phase_rate"):
+        if not L["gauge"]:
+            raise StopRun("phase data need the gauge length: set DAS_GAUGE_LENGTH_M")
+        d = d * phase_to_strain() / L["gauge"]
+    return d
+
+
+def resolve_ref_channel(L0):
+    if DAS_REF_DISTANCE_M is not None:
+        ch = int(round((float(DAS_REF_DISTANCE_M) - L0["dist0"]) / L0["dx"]))
+        if not 0 <= ch < L0["n_ch"]:
+            raise StopRun(f"DAS_REF_DISTANCE_M = {DAS_REF_DISTANCE_M} m is outside the zone "
+                          f"({L0['dist0']:g}-{L0['dist0'] + (L0['n_ch'] - 1) * L0['dx']:g} m)")
+        log(f"  DAS_REF_DISTANCE_M = {DAS_REF_DISTANCE_M:g} m -> channel {ch} "
+            f"({L0['dist0'] + ch * L0['dx']:.2f} m)")
+        return ch
+    return int(DAS_REF_CHANNEL)
+
+
+def load_das(t_a, t_b):
+    files = das_files((t_a, t_b))
+    cand = []
+    for p in files:
+        ft = name_time(os.path.basename(p))
+        if ft is not None and (ft > t_b + 120 or ft < t_a - 3 * 3600):
+            continue
+        cand.append(p)
+    pad = max(5.0, 5.0 / BAND_HZ[0])
+    layouts = []
+    for p in cand:
+        try:
+            L = das_layout(p)
+        except Exception as e:
+            log(f"  ! {os.path.basename(p)}: {e}")
+            continue
+        if L["t1"] > t_a - pad and L["t0"] < t_b + pad:
+            layouts.append(L)
+    if not any(L["t1"] > t_a and L["t0"] < t_b for L in layouts):
+        raise StopRun("no DAS file covers the requested window")
+    layouts.sort(key=lambda L: L["t0"])
+    L0 = next(L for L in layouts if L["t1"] > t_a)
+    ref = resolve_ref_channel(L0)
+    c0, c1 = ref, ref + 1
+    segs = []
+    for L in layouts:
+        if c1 > L["n_ch"]:
+            raise StopRun(f"channel {ref} requested, {os.path.basename(L['path'])} has {L['n_ch']} channels")
+        for t0, x in read_raw(L, c0, c1, t_a - pad, t_b + pad):
+            segs.append((t0, L["fs"], x, L))
+    merged, worst = merge_segments(segs)
+    n = int(round((t_b - t_a) * COMMON_FS_HZ))
+    out = np.full((n, c1 - c0), np.nan, np.float32)
+    n_nan, n_long = 0, 0
+    for t0, fs, x, L in merged:
+        n_nan += int((~np.isfinite(x)).sum())
+        x, long_mask = fill_nans(x, fs)
+        y = to_strain_rate(x, fs, L)
+        up, down = ratio(fs, COMMON_FS_HZ)
+        if (up, down) != (1, 1):
+            y = resample_poly(y, up, down, axis=0, padtype="line")
+        if long_mask.any():
+            tm = np.arange(len(y)) / COMMON_FS_HZ
+            gap = np.interp(tm, np.arange(len(long_mask)) / fs, long_mask.astype(float)) > 0
+            y[gap] = np.nan
+            n_long += int(long_mask.sum())
+        i0 = int(round((t0 - t_a) * COMMON_FS_HZ))
+        j0, j1 = max(0, -i0), min(len(y), n - i0)
+        if j1 > j0:
+            out[i0 + j0:i0 + j1] = y[j0:j1]
+    cover = float(np.isfinite(out[:, 0]).mean())
+    for k, L in enumerate(layouts):
+        log(f"  DAS {k + 1}/{len(layouts)}  {os.path.basename(L['path'])}")
+    extra = ""
+    if L0["format"] == "febus":
+        fb = L0["febus"]
+        extra = (f", {fb['zone'].rsplit('/', 1)[-1]}/{L0['dataset'].rsplit('/', 1)[-1]}, blocks of "
+                 f"{fb['n_pad']} samples keeping {fb['n_keep']} (period {fb['block_time']:g} s from "
+                 f"{fb['block_time_src']})")
+    log(f"  DAS ({L0['format']}{extra})")
+    log(f"  {len(layouts)} file(s), {len(merged)} continuous segment(s), largest join {1000 * worst:.1f} ms, "
+        f"fs {L0['fs']:g} Hz -> {COMMON_FS_HZ:g} Hz, GL {L0['gauge']} m, dx {L0['dx']:.4g} m, "
+        f"ch {ref} at {L0['dist0'] + ref * L0['dx']:.1f} m, coverage {100 * cover:.1f} %"
+        + (f", {n_nan} NaN raw samples ({n_nan - n_long} interpolated, {n_long} in runs > "
+           f"{DAS_NAN_MAX_FILL_SEC:g} s kept as gaps)" if n_nan else ""))
+    if cover == 0:
+        raise StopRun(f"DAS channel {ref} has no valid samples in the window (all NaN, e.g. beyond the fibre end): "
+                      f"choose another DAS_REF_CHANNEL")
+    return out, L0, ref
+
+SKIP_EXT = (".xml", ".txt", ".csv", ".json", ".png", ".jpg", ".jpeg", ".pdf", ".log", ".tmp")
+
+
+def open_seismic(path, **kw):
+    from obspy import read
+    if path.lower().endswith(".gz"):
+        with gzip.open(path, "rb") as fh:
+            return read(io.BytesIO(fh.read()), **kw)
+    return read(path, **kw)
+
+
+def parse_time(text):
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            return to_posix(datetime.datetime.strptime(str(text).strip(), fmt))
+        except ValueError:
+            continue
+    raise StopRun(f"cannot read the time {text!r}: use 'YYYY-MM-DD HH:MM:SS'")
+
+
+def configured_window():
+    if str(START_TIME).strip().lower() == "auto":
+        return None
+    t_a = parse_time(START_TIME)
+    t_b = parse_time(END_TIME) if END_TIME else t_a + DURATION_MIN * 60
+    if t_b <= t_a:
+        raise StopRun(f"END_TIME {utc_text(t_b)} is not after START_TIME {utc_text(t_a)}")
+    if (t_b - t_a) / 3600 > MAX_WINDOW_HOURS:
+        raise StopRun(f"the window is {(t_b - t_a) / 3600:.1f} h, longer than MAX_WINDOW_HOURS = {MAX_WINDOW_HOURS:g} h "
+                      f"(memory grows with the window length); split it or raise MAX_WINDOW_HOURS")
+    if (t_b - t_a) < 4 * SEG_SEC:
+        raise StopRun(f"the window is shorter than 4 segments of SEG_SEC = {SEG_SEC:g} s")
+    return t_a, t_b
+
+
+def cache_dir():
+    d = CACHE_FOLDER or os.path.join(OUTPUT_FOLDER, "_cache")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def name_time(name):
+    t = filename_time(name)
+    if t is not None:
+        return t
+    m = re.search(r"(20\d{2})[-_.]?([01]\d)[-_.]?([0-3]\d)[T_\-\s]?([0-2]\d)[-_.:]?([0-5]\d)[-_.:]?([0-5]\d)", name)
+    if not m:
+        return None
+    try:
+        return to_posix(datetime.datetime(*[int(x) for x in m.groups()]))
+    except ValueError:
+        return None
+
+
+def quick_span(path):
+    if not path.lower().endswith(".gz"):
+        try:
+            from obspy.io.mseed.util import get_record_information
+            a = get_record_information(path)
+            size = os.path.getsize(path)
+            b = get_record_information(path, offset=size - a["record_length"]) if size > a["record_length"] else a
+            t0 = min(a["starttime"].timestamp, b["starttime"].timestamp)
+            t1 = max(a["endtime"].timestamp, b["endtime"].timestamp)
+            return t0, t1, "record headers"
+        except Exception:
+            pass
+    t = name_time(os.path.basename(path))
+    if t is not None:
+        return t, None, "file name"
+    return None, None, "unknown"
+
+
+def window_files(files, t_a, t_b):
+    keep, spans = [], []
+    how = {"record headers": 0, "file name": 0, "unknown": 0}
+    for p in files:
+        t0, t1, h = quick_span(p)
+        how[h] += 1
+        if t0 is None:
+            keep.append(p)
+            continue
+        spans.append((t0, t1 if t1 is not None else t0))
+        if t1 is not None:
+            if t1 >= t_a - 60 and t0 <= t_b + 60:
+                keep.append(p)
+        elif t_a - SEIS_NAME_MARGIN_H * 3600 <= t0 <= t_b + 60:
+            keep.append(p)
+    log(f"  {len(keep)} of {len(files)} seismic files overlap the window "
+        f"(times from record headers: {how['record headers']}, file names: {how['file name']}, "
+        f"unknown, kept anyway: {how['unknown']})")
+    if not keep and spans:
+        raise StopRun(f"no seismic file overlaps {utc_text(t_a)} - {utc_text(t_b)} UTC.\n"
+                      f"    seismic files span {utc_text(min(a for a, _ in spans))} - "
+                      f"{utc_text(max(b for _, b in spans))} UTC\n"
+                      f"    set START_TIME / END_TIME inside that span")
+    return keep
+
+
+def seis_index(files, win=None):
+    tag = "all" if win is None else f"{utc_text(win[0], '%Y%m%d_%H%M%S')}_{utc_text(win[1], '%Y%m%d_%H%M%S')}"
+    cache = os.path.join(cache_dir(), f"_seismic_index_{SEIS_STATION}_{tag}.json")
+    idx = {}
+    if os.path.exists(cache):
+        try:
+            with open(cache, encoding="utf-8") as fh:
+                idx = json.load(fh)
+        except Exception:
+            idx = {}
+    changed, out = False, []
+    for p in files:
+        k = os.path.abspath(p)
+        st_ = os.stat(p)
+        e = idx.get(k)
+        if e is None or e.get("size") != st_.st_size or abs(e.get("mtime", 0) - st_.st_mtime) > 2:
+            try:
+                st = open_seismic(p, headonly=True)
+                e = {"size": st_.st_size, "mtime": st_.st_mtime,
+                     "traces": [[t.id, t.stats.starttime.timestamp, t.stats.endtime.timestamp,
+                                 float(t.stats.sampling_rate)] for t in st]}
+            except Exception as ex:
+                e = {"size": st_.st_size, "mtime": st_.st_mtime, "traces": [], "error": str(ex)[:200]}
+            idx[k] = e
+            changed = True
+        out.append((p, e))
+    if changed:
+        try:
+            with open(cache + ".tmp", "w", encoding="utf-8") as fh:
+                json.dump(idx, fh)
+            os.replace(cache + ".tmp", cache)
+        except OSError:
+            pass
+    return out
+
+
+def station_codes():
+    return [SEIS_STATION] + [a for a in SEIS_STATION_ALIASES if a]
+
+
+def name_has_station(path):
+    name = os.path.basename(path)
+    return any(re.search(rf"(^|[^A-Za-z0-9]){re.escape(c)}([^A-Za-z0-9]|$)", name) for c in station_codes())
+
+
+def merge_intervals(iv, gap=1.0):
+    out = []
+    for a_, b_ in sorted(iv):
+        if out and a_ <= out[-1][1] + gap:
+            out[-1][1] = max(out[-1][1], b_)
+        else:
+            out.append([a_, b_])
+    return out
+
+
+def intersect_intervals(x, y):
+    out, i, j = [], 0, 0
+    while i < len(x) and j < len(y):
+        a_, b_ = max(x[i][0], y[j][0]), min(x[i][1], y[j][1])
+        if b_ > a_:
+            out.append([a_, b_])
+        if x[i][1] < y[j][1]:
+            i += 1
+        else:
+            j += 1
+    return out
+
+
+def select_seismic(index):
+    import fnmatch
+    found, groups, errors = {}, {}, [(p, e["error"]) for p, e in index if e.get("error")]
+    for p, e in index:
+        for tid, t0, t1, fs in e.get("traces", []):
+            net, sta, loc, cha = (tid.split(".") + ["", "", "", ""])[:4]
+            rec = found.setdefault(tid, [np.inf, -np.inf, 0, fs])
+            rec[0], rec[1], rec[2] = min(rec[0], t0), max(rec[1], t1), rec[2] + 1
+            if not (fnmatch.fnmatchcase(net, SEIS_NETWORK) and fnmatch.fnmatchcase(loc, SEIS_LOCATION)
+                    and fnmatch.fnmatchcase(cha, SEIS_CHANNELS)) or len(cha) < 3:
+                continue
+            by_hdr = any(fnmatch.fnmatchcase(sta, c) for c in station_codes())
+            by_name = SEIS_MATCH_FILENAME and name_has_station(p)
+            if not (by_hdr or by_name):
+                continue
+            g = groups.setdefault((net, sta, loc, cha[:2]), {"fs": 0.0, "comps": {}, "how": "header" if by_hdr else "file name"})
+            g["fs"] = max(g["fs"], fs)
+            g["comps"].setdefault(cha, []).append((p, t0, t1))
+    if errors:
+        log(f"  ! {len(errors)} of {len(index)} files could not be read, e.g. "
+            f"{os.path.basename(errors[0][0])}: {errors[0][1]}")
+    usable = {k: g for k, g in groups.items() if len(g["comps"]) >= 3 and g["fs"] >= SEIS_MIN_FS_HZ}
+    if not usable:
+        lines = "\n".join(f"      {k}: {v[2]} file(s), {v[3]:g} Hz, {utc_text(v[0])} - {utc_text(v[1])}"
+                          for k, v in sorted(found.items())[:40]) or "      (no readable seismic traces)"
+        raise StopRun(f"no three-component set of at least {SEIS_MIN_FS_HZ:g} Hz in {SEIS_FOLDER} for station "
+                      f"{'/'.join(station_codes())} ({len(index)} files scanned).\n"
+                      f"    traces found in the folder:\n{lines}\n"
+                      f"    set SEIS_STATION / SEIS_STATION_ALIASES / SEIS_CHANNELS accordingly")
+    key = max(usable, key=lambda k: (usable[k]["fs"], sum(len(v) for v in usable[k]["comps"].values())))
+    g = usable[key]
+    comps = sorted(g["comps"])[:3] if len(g["comps"]) == 3 else sorted(
+        g["comps"], key=lambda c: (c[-1] not in "ZNE123", c))[:3]
+    ids = {f"{key[0]}.{key[1]}.{key[2]}.{c}": g["how"] for c in comps}
+    ignored = sorted({tid.split(".")[3] for tid in found} - set(comps))
+    log(f"  using {', '.join(sorted(ids))} ({g['fs']:g} Hz, matched by {g['how']})")
+    if ignored:
+        log(f"  ignored channels: {', '.join(ignored)}")
+    per_comp = [merge_intervals([(t0, t1) for _, t0, t1 in g["comps"][c]], gap=2.0 / g["fs"] + 0.05) for c in comps]
+    cover = per_comp[0]
+    for iv in per_comp[1:]:
+        cover = intersect_intervals(cover, iv)
+    files = sorted({(p, t0, t1) for c in comps for p, t0, t1 in g["comps"][c]}, key=lambda x: x[1])
+    return dict(ids=ids, cover=cover, files=files, fs=g["fs"])
+
+
+def das_file_start(p):
+    t = name_time(os.path.basename(p))
+    if t is not None:
+        return t, True
+    try:
+        return das_layout(p)["t0"], False
+    except Exception:
+        return None, False
+
+
+def das_files(win=None):
+    if not os.path.isdir(DAS_FOLDER):
+        raise StopRun(f"DAS_FOLDER does not exist: {DAS_FOLDER}")
+    pats = [DAS_PATTERN] if isinstance(DAS_PATTERN, str) else list(DAS_PATTERN)
+    found = []
+    for pat in pats:
+        found += glob.glob(os.path.join(DAS_FOLDER, "**" if DAS_RECURSIVE else "", pat), recursive=DAS_RECURSIVE)
+    seen, files = set(), []
+    for p in sorted(set(found)):
+        b = os.path.basename(p)
+        if b.startswith("._") or b in seen or os.sep + "_cache" in p:
+            continue
+        seen.add(b)
+        files.append(p)
+    if not files:
+        subs = sorted(d for d in os.listdir(DAS_FOLDER) if os.path.isdir(os.path.join(DAS_FOLDER, d)))
+        raise StopRun(f"no DAS files matching {', '.join(pats)} in {DAS_FOLDER}"
+                      f"{' or its subfolders' if DAS_RECURSIVE else ''}.\n"
+                      f"    subfolders there: {', '.join(subs[:30]) or 'none'}\n"
+                      f"    set DAS_FOLDER to the folder that holds the DAS .h5 files")
+    if win is None:
+        return files
+    t_a, t_b = win
+    named = [(name_time(os.path.basename(p)), p) for p in files]
+    near = sorted((abs(ft - t_a), p) for ft, p in named if ft is not None and t_a - 6 * 3600 <= ft <= t_b)
+    dur = 3600.0
+    for _, p in near[:3] or [(0, files[0])]:
+        try:
+            L = das_layout(p)
+            dur = L["t1"] - L["t0"]
+            break
+        except Exception:
+            continue
+    kept, unnamed = [], 0
+    for ft, p in named:
+        if ft is None:
+            unnamed += 1
+            try:
+                L = das_layout(p)
+                if L["t1"] > t_a and L["t0"] < t_b:
+                    kept.append(p)
+            except Exception:
+                continue
+        elif ft - 60 < t_b and ft + dur + 60 > t_a:
+            kept.append(p)
+    log(f"  {len(kept)} of {len(files)} DAS files overlap the window"
+        + (f" ({unnamed} without a time in the name were checked by header)" if unnamed else ""))
+    if not kept:
+        ts = [t for t, _ in named if t is not None]
+        span = f"{utc_text(min(ts))} - {utc_text(max(ts) + dur)} UTC" if ts else "unknown"
+        raise StopRun(f"no DAS file in {DAS_FOLDER} overlaps {utc_text(t_a)} - {utc_text(t_b)} UTC.\n"
+                      f"    DAS files span {span}")
+    return kept
+
+
+def das_coverage(win=None):
+    files = das_files(win)
+    by_dir = {}
+    for p in files:
+        by_dir.setdefault(os.path.dirname(p), []).append(p)
+    for d, fl in sorted(by_dir.items()):
+        ts = [t for t in (name_time(os.path.basename(x)) for x in fl) if t is not None]
+        span = f", {utc_text(min(ts), '%Y-%m-%d %H:%M')} - {utc_text(max(ts), '%Y-%m-%d %H:%M')} UTC" if ts else ""
+        log(f"  DAS folder {os.path.relpath(d, DAS_FOLDER)}: {len(fl)} files{span}")
+    dur = None
+    for p in files[:: max(1, len(files) // 20)] + files[:5]:
+        try:
+            L = das_layout(p)
+            dur = L["t1"] - L["t0"]
+            break
+        except Exception:
+            continue
+    if dur is None:
+        raise StopRun(f"none of the DAS files in {DAS_FOLDER} could be opened as Febus or Sintela HDF5")
+    iv = []
+    for p in files:
+        t, by_name = das_file_start(p)
+        if t is not None:
+            iv.append((t, t + dur))
+    cover = merge_intervals(iv, gap=2.0)
+    return cover, len(files), dur
+
+
+def describe_intervals(iv, n=12):
+    rows = [f"      {utc_text(a_, '%Y-%m-%d %H:%M')} - {utc_text(b_, '%Y-%m-%d %H:%M')} UTC "
+            f"({(b_ - a_) / 3600:.1f} h)" for a_, b_ in iv[:n]]
+    if len(iv) > n:
+        rows.append(f"      ... {len(iv) - n} more")
+    return "\n".join(rows) or "      none"
+
+
+def choose_window(sel, win=None):
+    das_iv, n_das, dur = das_coverage(win)
+    seis_iv = merge_intervals(sel["cover"], gap=1.0)
+    common = [iv for iv in intersect_intervals(das_iv, seis_iv) if iv[1] - iv[0] >= 2 * SEG_SEC]
+    log(f"  DAS: {n_das} files of {dur:g} s, {utc_text(das_iv[0][0], '%Y-%m-%d %H:%M')} - "
+        f"{utc_text(das_iv[-1][1], '%Y-%m-%d %H:%M')} UTC in {len(das_iv)} block(s)")
+    log(f"  seismometer: {utc_text(seis_iv[0][0], '%Y-%m-%d %H:%M')} - "
+        f"{utc_text(seis_iv[-1][1], '%Y-%m-%d %H:%M')} UTC in {len(seis_iv)} block(s)")
+    need = DURATION_MIN * 60
+    if win is not None:
+        t_a, t_b = win
+        need = t_b - t_a
+        ov = sum(max(0.0, min(b_, t_b) - max(a_, t_a)) for a_, b_ in common)
+        if ov < 4 * SEG_SEC:
+            raise StopRun(f"DAS and seismometer do not both cover {utc_text(t_a)} - {utc_text(t_b)} UTC.\n"
+                          f"    DAS in the window:\n{describe_intervals(das_iv)}\n"
+                          f"    seismometer in the window:\n{describe_intervals(seis_iv)}\n"
+                          f"    choose START_TIME / END_TIME where both record")
+        if ov < 0.8 * need:
+            log(f"  ! only {ov / 60:.0f} of {need / 60:.0f} min are covered by both instruments")
+        return t_a, t_b
+    if not common:
+        raise StopRun(f"DAS and seismometer never record at the same time.\n"
+                      f"    DAS:\n{describe_intervals(das_iv)}\n    seismometer:\n{describe_intervals(seis_iv)}")
+    long_ = [iv for iv in common if iv[1] - iv[0] >= need]
+    a_, b_ = (long_[0] if long_ else max(common, key=lambda iv: iv[1] - iv[0]))
+    t_a = math.ceil(a_ / 60.0) * 60.0
+    t_b = min(b_, t_a + need)
+    if t_b - t_a < need:
+        log(f"  ! longest common period is {(t_b - t_a) / 60:.0f} min, shorter than DURATION_MIN = {DURATION_MIN:g}")
+    log(f"  START_TIME = auto -> {utc_text(t_a)} UTC (first period covered by both)")
+    log(f"  periods covered by both:\n{describe_intervals(common, 6)}")
+    return t_a, t_b
+
+
+def inv_channel(inv, tr):
+    net, sta, loc, cha = tr.stats.network, tr.stats.station, tr.stats.location, tr.stats.channel
+    t = tr.stats.starttime
+    allc = [(n, s, c) for n in inv for s in n for c in s]
+    exact = [x for x in allc if x[0].code == net and x[1].code == sta and x[2].location_code == loc
+             and x[2].code == cha and x[2].is_active(time=t)]
+    if exact:
+        return exact[0], "exact id"
+    same = [x for x in allc if x[2].code == cha]
+    timed = [x for x in same if x[2].is_active(time=t)] or same
+    pref = [x for x in timed if x[1].code in station_codes()] or timed
+    if not pref:
+        raise StopRun(f"no channel {cha} in RESPONSE_FILES for {tr.id}; channels there: "
+                      f"{sorted({x[2].code for x in allc})}")
+    return pref[0], "channel code"
+
+
+def load_inventory():
+    from obspy import read_inventory, Inventory
+    inv = Inventory(networks=[], source="merged")
+    files = sorted({p for g in RESPONSE_FILES for p in glob.glob(g)})
+    for p in files:
+        try:
+            inv += read_inventory(p)
+        except Exception as e:
+            log(f"  ! response file {os.path.basename(p)}: {e}")
+    if not inv.networks:
+        raise StopRun("no readable StationXML in RESPONSE_FILES")
+    log(f"  StationXML: {len(files)} file(s)")
+    return inv
+
+
+def unit_vector(az, dip):
+    a, d = math.radians(az), math.radians(dip)
+    return np.array([math.cos(d) * math.sin(a), math.cos(d) * math.cos(a), -math.sin(d)])
+
+
+def component_vector(comp):
+    comp = comp.upper()
+    if comp in ("N", "1"):
+        return unit_vector(SEIS_H1_AZIMUTH_DEG, 0)
+    if comp in ("E", "2"):
+        return unit_vector(SEIS_H1_AZIMUTH_DEG + 90, 0)
+    if comp in ("Z", "3", "U"):
+        return unit_vector(0, -90)
+    raise StopRun(f"unknown component {comp!r} in SEIS_COMPONENT_MAP (use Z, N, E)")
+
+
+def seed_component(cha):
+    c = cha[-1].upper()
+    return {"Z": "Z", "N": "N", "E": "E", "1": "N", "2": "E", "3": "Z"}.get(c)
+
+
+def scan_seismic(win=None):
+    files = sorted(p for p in glob.glob(os.path.join(SEIS_FOLDER, "**" if SEIS_RECURSIVE else "", SEIS_PATTERN),
+                                        recursive=SEIS_RECURSIVE)
+                   if os.path.isfile(p) and not p.lower().endswith(SKIP_EXT))
+    if not files:
+        raise StopRun(f"no files matching {SEIS_PATTERN!r} in {SEIS_FOLDER}")
+    if win is not None:
+        files = window_files(files, *win)
+    log(f"  reading headers of {len(files)} seismic files (cache in {cache_dir()})")
+    return select_seismic(seis_index(files, win))
+
+
+def load_seismic(t_a, t_b, inv, sel):
+    from obspy import Stream, UTCDateTime
+    ids = sel["ids"]
+    need = sorted({p for p, t0, t1 in sel["files"] if t1 > t_a - 60 and t0 < t_b + 60})
+    st = Stream()
+    for p in need:
+        try:
+            part = open_seismic(p, starttime=UTCDateTime(t_a - 60), endtime=UTCDateTime(t_b + 60))
+        except Exception as e:
+            log(f"  ! {os.path.basename(p)}: {e}")
+            continue
+        st += Stream([t for t in part if t.id in ids])
+    if not len(st):
+        raise StopRun("the selected seismic files returned no samples in the window")
+    log(f"  seismic: {len(need)} file(s) read")
+    st.merge(method=1)
+    st = st.split()
+    n = int(round((t_b - t_a) * COMMON_FS_HZ))
+    grids, vectors, info, coords, used = {}, {}, {}, None, {}
+    for tr in st:
+        cha = tr.stats.channel
+        (net_i, sta_i, ch_i), how = inv_channel(inv, tr)
+        key = f"{net_i.code}.{sta_i.code}.{ch_i.location_code}.{ch_i.code}"
+        if cha not in used:
+            used[cha] = key
+            log(f"  response for {tr.id}: {key} (matched by {how})")
+        if coords is None:
+            coords = {"latitude": ch_i.latitude if ch_i.latitude is not None else sta_i.latitude,
+                      "longitude": ch_i.longitude if ch_i.longitude is not None else sta_i.longitude}
+        try:
+            nyq = tr.stats.sampling_rate / 2.0
+            tr.detrend("demean")
+            tr.stats.response = ch_i.response
+            tr.remove_response(inventory=None, output="VEL", water_level=SEIS_WATER_LEVEL_DB,
+                               pre_filt=(SEIS_PREFILT_LO_HZ[0], SEIS_PREFILT_LO_HZ[1], 0.8 * nyq, 0.95 * nyq),
+                               taper=True, taper_fraction=0.02)
+        except Exception as e:
+            raise StopRun(f"response removal failed for {tr.id} with {key}: {e}")
+        y = tr.data.astype(np.float64)
+        up, down = ratio(tr.stats.sampling_rate, COMMON_FS_HZ)
+        if (up, down) != (1, 1):
+            y = resample_poly(y, up, down, padtype="line")
+        t0 = tr.stats.starttime.timestamp + SEIS_TIME_SHIFT_SEC
+        i0 = int(round((t0 - t_a) * COMMON_FS_HZ))
+        g = grids.setdefault(cha, np.full(n, np.nan))
+        j0, j1 = max(0, -i0), min(len(y), n - i0)
+        if j1 > j0:
+            g[i0 + j0:i0 + j1] = y[j0:j1]
+        if cha not in vectors:
+            if SEIS_COMPONENT_MAP and cha in SEIS_COMPONENT_MAP:
+                comp = SEIS_COMPONENT_MAP[cha].upper()
+                vectors[cha] = component_vector(comp)
+                info[cha] = f"{comp} (SEIS_COMPONENT_MAP)"
+            elif ch_i.azimuth is not None and ch_i.dip is not None:
+                vectors[cha] = unit_vector(ch_i.azimuth, ch_i.dip)
+                info[cha] = f"azimuth {ch_i.azimuth:g}, dip {ch_i.dip:g} (StationXML {key})"
+            else:
+                vectors[cha] = None
+                info[cha] = f"no azimuth/dip in StationXML {key}"
+            info[cha] += f", {tr.stats.sampling_rate:g} Hz"
+    chans = sorted(grids)
+    if len(chans) < 3:
+        raise StopRun(f"three components needed, found {chans}")
+    chans = chans[:3]
+    bad = any(vectors[c] is None for c in chans) or abs(np.linalg.det(np.vstack(
+        [vectors[c] if vectors[c] is not None else np.zeros(3) for c in chans]))) < 0.3
+    if bad:
+        seed = {c: seed_component(c) for c in chans}
+        if sorted(v or "" for v in seed.values()) != ["E", "N", "Z"]:
+            raise StopRun("seismometer orientations are missing or not independent ("
+                          + "; ".join(f"{c}: {info[c]}" for c in chans)
+                          + "): set SEIS_COMPONENT_MAP, e.g. {'CH1': 'N', 'CH2': 'E', 'CHZ': 'Z'}")
+        log("  ! StationXML azimuth/dip are placeholders (" + "; ".join(f"{c}: {info[c].split(',')[0]}"
+            for c in chans) + ")")
+        log("    using the SEED channel convention: " + ", ".join(f"{c} = {seed[c]}" for c in chans)
+            + f", component 1 at azimuth {SEIS_H1_AZIMUTH_DEG:g}°")
+        log("    set SEIS_COMPONENT_MAP / SEIS_H1_AZIMUTH_DEG if the sensor was installed differently")
+        for c in chans:
+            vectors[c] = component_vector(seed[c])
+            info[c] = f"{seed[c]} (SEED convention, StationXML orientation missing)" + ", " + info[c].split(", ")[-1]
+    U = np.vstack([vectors[c] for c in chans])
+    X = np.vstack([grids[c] for c in chans])
+    ENZ = np.linalg.solve(U, np.nan_to_num(X)).T
+    ENZ[~np.all(np.isfinite(X), axis=0)] = np.nan
+    for c in chans:
+        log(f"  seismometer {c}: {info[c]}")
+    sid = f"{st[0].stats.network}.{SEIS_STATION}"
+    log(f"  seismometer: {sid}, coverage {100 * np.isfinite(ENZ[:, 0]).mean():.1f} % of the window")
+    return ENZ.astype(np.float32), sid, coords, {c: info[c] for c in chans}
+
+
+def station_location(coords_xml):
+    if SEIS_STATION_COORDS:
+        return {"latitude": float(SEIS_STATION_COORDS[0]), "longitude": float(SEIS_STATION_COORDS[1])}, \
+            "SEIS_STATION_COORDS"
+    if STATION_LOCATIONS_FILE and os.path.exists(STATION_LOCATIONS_FILE):
+        try:
+            import pandas as pd
+            ext = os.path.splitext(STATION_LOCATIONS_FILE)[1].lower()
+            df = (pd.read_excel(STATION_LOCATIONS_FILE) if ext in (".xlsx", ".xls")
+                  else pd.read_csv(STATION_LOCATIONS_FILE, sep=None, engine="python"))
+            norm = {re.sub(r"[^a-z]", "", str(c).lower()): c for c in df.columns}
+            lat_c = next((norm[k] for k in norm if k.startswith("lat")), None)
+            lon_c = next((norm[k] for k in norm if k.startswith(("lon", "lng"))), None)
+            if lat_c and lon_c:
+                for c in [x.upper() for x in station_codes()]:
+                    for _, r in df.iterrows():
+                        txt = " ".join(str(v) for v in r.values if isinstance(v, str)).upper()
+                        if re.search(rf"(^|[^A-Z0-9]){re.escape(c)}([^A-Z0-9]|$)", txt):
+                            return ({"latitude": float(r[lat_c]), "longitude": float(r[lon_c])},
+                                    f"{os.path.basename(STATION_LOCATIONS_FILE)} ({c})")
+                log(f"  ! {SEIS_STATION} not found in {os.path.basename(STATION_LOCATIONS_FILE)}")
+        except Exception as e:
+            log(f"  ! {os.path.basename(STATION_LOCATIONS_FILE)}: {e}")
+    if coords_xml and coords_xml.get("latitude") and abs(coords_xml["latitude"]) > 1e-6:
+        return coords_xml, "StationXML"
+    return None, "none"
+
+
+def fibre_geometry(channels, dx, station_coords, coord_src):
+    chs = np.asarray(channels)
+    geo = dict(az=np.full(len(chs), np.nan), dist=np.full(len(chs), np.nan), source="none",
+               nearest=None, nearest_dist=np.nan, coord_src=coord_src)
+    if FIBRE_AZIMUTH_DEG is not None:
+        geo["az"][:] = float(FIBRE_AZIMUTH_DEG)
+        geo["source"] = f"FIBRE_AZIMUTH_DEG = {FIBRE_AZIMUTH_DEG}"
+        return geo
+    if not FIBRE_CHANNELS_CSV or not os.path.exists(FIBRE_CHANNELS_CSV):
+        log("  ! no fibre channel table and no FIBRE_AZIMUTH_DEG: the fibre-axial projection is not possible")
+        return geo
+    tab = np.genfromtxt(FIBRE_CHANNELS_CSV, delimiter=",", names=True, dtype=None, encoding="utf-8")
+    ch_t = np.asarray(tab["channel"], int)
+    lat, lon = np.asarray(tab["latitude"], float), np.asarray(tab["longitude"], float)
+    lat0 = float(np.nanmean(lat))
+    kx, ky = 111320.0 * math.cos(math.radians(lat0)), 110540.0
+    X, Y = lon * kx, lat * ky
+    k = max(1, int(round(AZIMUTH_HALF_WIN_M / dx)))
+    for i, c in enumerate(chs):
+        a = np.searchsorted(ch_t, c - k)
+        b = np.searchsorted(ch_t, c + k, side="right") - 1
+        if a < len(ch_t) and b > a:
+            geo["az"][i] = math.degrees(math.atan2(X[b] - X[a], Y[b] - Y[a])) % 360
+    geo["source"] = os.path.basename(FIBRE_CHANNELS_CSV)
+    if station_coords:
+        sx, sy = station_coords["longitude"] * kx, station_coords["latitude"] * ky
+        d_all = np.hypot(X - sx, Y - sy)
+        j = int(np.argmin(d_all))
+        geo["nearest_dist"] = float(d_all[j])
+        for i, c in enumerate(chs):
+            m = np.searchsorted(ch_t, c)
+            if m < len(ch_t) and ch_t[m] == c:
+                geo["dist"][i] = float(d_all[m])
+        if d_all[j] <= MAX_STATION_FIBRE_M:
+            geo["nearest"] = int(ch_t[j])
+            log(f"  {SEIS_STATION} position from {coord_src}: nearest channel {ch_t[j]}, {d_all[j]:.1f} m from the fibre")
+            if not (chs[0] <= ch_t[j] <= chs[-1]):
+                log(f"  ! nearest channel {ch_t[j]} is outside the analysed channels {chs[0]}-{chs[-1]}")
+        else:
+            log(f"  ! {SEIS_STATION} position from {coord_src} is {d_all[j]:.0f} m from the fibre: not used "
+                f"(set SEIS_STATION_COORDS or STATION_LOCATIONS_FILE)")
+    ok = np.isfinite(geo["az"])
+    if ok.any():
+        log(f"  fibre azimuth from {geo['source']}: {np.nanmin(geo['az']):.0f}-{np.nanmax(geo['az']):.0f} deg "
+            f"over channels {chs[ok].min()}-{chs[ok].max()}")
+    return geo
+
+
+def effective_band(native_rates):
+    lo, hi = float(BAND_HZ[0]), float(BAND_HZ[1])
+    cap = 0.45 * min([COMMON_FS_HZ] + [float(r) for r in native_rates if r])
+    if hi > cap:
+        log(f"  ! BAND_HZ upper corner {hi:g} Hz is above 0.45 x the lowest sampling rate: using {cap:.3g} Hz")
+        hi = float(f"{cap:.3g}")
+    if lo >= hi:
+        raise StopRun(f"band {lo:g}-{hi:g} Hz is empty: lower BAND_HZ[0]")
+    return lo, hi
+
+
+def bandpass(x, band):
+    sos = butter(4, [band[0], band[1]], btype="bandpass", fs=COMMON_FS_HZ, output="sos")
+    return sosfiltfilt(sos, np.asarray(x, np.float64), axis=0)
+
+
+def by_segment(x, ok, func, band):
+    out = np.full(len(x), np.nan)
+    edges = np.flatnonzero(np.diff(np.r_[0, ok.astype(int), 0]))
+    pad = int(round(5.0 / band[0] * COMMON_FS_HZ))
+    for a, b in zip(edges[::2], edges[1::2]):
+        if b - a < int(LTA_SEC * COMMON_FS_HZ):
+            continue
+        p_ = min(pad, b - a - 1)
+        y = func(np.pad(np.asarray(x[a:b], np.float64), (p_, p_), mode="reflect"))
+        out[a:b] = y[p_:p_ + (b - a)]
+    return out
+
+
+def quantities():
+    q = QUANTITY_PAIR.replace(" ", "").lower()
+    if q in ("strain_rate/acceleration", "strainrate/acceleration"):
+        return "strain_rate", "acceleration"
+    if q in ("strain/velocity",):
+        return "strain", "velocity"
+    raise StopRun("QUANTITY_PAIR must be 'strain_rate/acceleration' or 'strain/velocity'")
+
+
+def prepare_traces(das, enz, geo, iref, band):
+    q_das, q_seis = quantities()
+    ok_d = np.isfinite(das[:, iref])
+    ok_s = np.all(np.isfinite(enz), axis=1)
+    if SEIS_COMPONENT == "axial" and np.isfinite(geo["az"][iref]):
+        a_ = math.radians(float(geo["az"][iref]))
+        v = enz[:, 0] * math.sin(a_) + enz[:, 1] * math.cos(a_)
+        comp = f"fibre-axial (az {float(geo['az'][iref]):.0f}°)"
+    else:
+        k = {"E": 0, "N": 1, "Z": 2}.get(str(SEIS_COMPONENT).upper(), 0)
+        v = enz[:, k]
+        comp = "ENZ"[k] + (" (no fibre azimuth)" if SEIS_COMPONENT == "axial" else "")
+    if q_das == "strain_rate":
+        d = by_segment(das[:, iref], ok_d, lambda z: bandpass(z, band), band) * 1e9
+        d_unit, d_name, d_si = "nε/s", "strain rate", 1e-9
+    else:
+        d = by_segment(das[:, iref], ok_d,
+                       lambda z: bandpass(np.cumsum(z - z.mean()) / COMMON_FS_HZ, band), band) * 1e9
+        d_unit, d_name, d_si = "nε", "strain", 1e-9
+    vb = by_segment(v, ok_s, lambda z: bandpass(z, band), band)
+    if q_seis == "acceleration":
+        s = np.gradient(vb, 1.0 / COMMON_FS_HZ) * 1e3
+        s_unit, s_name, s_si = "mm/s²", "acceleration", 1e-3
+    else:
+        s = vb * 1e6
+        s_unit, s_name, s_si = "µm/s", "velocity", 1e-6
+    return dict(d=d, s=s, d_unit=d_unit, s_unit=s_unit, d_name=d_name, s_name=s_name, comp=comp,
+                d_si=d_si, s_si=s_si, band=band)
+
+
+def make_equivalent_acceleration(T):
+    if T["d_name"] != "strain rate" or T["s_name"] != "acceleration":
+        raise StopRun("Equivalent acceleration plots require QUANTITY_PAIR = 'strain_rate/acceleration'")
+    if not np.isfinite(FK_APPARENT_VELOCITY_MPS) or FK_APPARENT_VELOCITY_MPS <= 0:
+        raise StopRun("FK_APPARENT_VELOCITY_MPS must be a finite positive velocity in m/s")
+    A = dict(T)
+    A["d"] = np.asarray(T["d"], dtype=np.float64) * FK_APPARENT_VELOCITY_MPS * 1e-6
+    A["d_unit"] = "mm/s²"
+    A["d_name"] = "estimated axial acceleration"
+    A["d_si"] = 1e-3
+    A["equivalent_velocity_mps"] = float(FK_APPARENT_VELOCITY_MPS)
+    A["equivalent_velocity_source"] = FK_VELOCITY_SOURCE
+    return A
+
+
+def sta_lta(x):
+    from obspy.signal.trigger import classic_sta_lta
+    ok = np.isfinite(x)
+    y = np.where(ok, x, 0.0)
+    nsta, nlta = int(round(STA_SEC * COMMON_FS_HZ)), int(round(LTA_SEC * COMMON_FS_HZ))
+    r = classic_sta_lta(y, nsta, nlta)
+    bad = ~ok
+    if bad.any():
+        cum_bad = np.r_[0, np.cumsum(bad.astype(np.int64))]
+        idx = np.arange(len(bad))
+        left = np.maximum(0, idx - nlta + 1)
+        r[(cum_bad[idx + 1] - cum_bad[left]) > 0] = 0.0
+    r[:nlta] = 0.0
+    return r
+
+
+def detect(r, x, t0):
+    from obspy.signal.trigger import trigger_onset
+    on_off = trigger_onset(r, TRIGGER_ON, TRIGGER_OFF) if np.nanmax(r) >= TRIGGER_ON else []
+    ev = []
+    for a, b in on_off:
+        if (b - a) / COMMON_FS_HZ < MIN_EVENT_SEC:
+            continue
+        if ev and (a - ev[-1]["off_i"]) / COMMON_FS_HZ < DECLUSTER_SEC:
+            ev[-1]["off_i"] = int(b)
+            continue
+        ev.append(dict(on_i=int(a), off_i=int(b)))
+    npre = int(round(PRE_EVENT_NOISE_SEC * COMMON_FS_HZ))
+    for e in ev:
+        a, b = e["on_i"], max(e["off_i"], e["on_i"] + 1)
+        seg = x[a:b]
+        pre = x[max(0, a - npre):a]
+        sig_e2 = float(np.nanmean(seg ** 2)) if np.isfinite(seg).any() else np.nan
+        sig_n2 = float(np.nanmean(pre ** 2)) if len(pre) and np.isfinite(pre).any() else np.nan
+        exc = max(sig_e2 - sig_n2, 0.0) / sig_n2 if sig_n2 and np.isfinite(sig_n2) else np.nan
+        e.update(t_on=t0 + a / COMMON_FS_HZ, t_off=t0 + b / COMMON_FS_HZ, dur=(b - a) / COMMON_FS_HZ,
+                 peak_ratio=float(np.max(r[a:b])), peak_amp=float(np.nanmax(np.abs(seg))),
+                 snr_total=sig_e2 / sig_n2 if sig_n2 else np.nan,
+                 snr_excess_db=10 * math.log10(exc) if exc and exc > 0 else np.nan)
+    return ev
+
+
+def match(ev_d, ev_s):
+    pairs, used_s = [], set()
+    for i, e in enumerate(ev_d):
+        best, bj = None, None
+        for j, f in enumerate(ev_s):
+            if j in used_s:
+                continue
+            dt = e["t_on"] - f["t_on"]
+            if abs(dt) <= MATCH_TOL_SEC and (best is None or abs(dt) < abs(best)):
+                best, bj = dt, j
+        if bj is not None:
+            used_s.add(bj)
+            pairs.append((i, bj, best))
+            e["match"] = "common"
+            ev_s[bj]["match"] = "common"
+    for e in ev_d:
+        e.setdefault("match", "DAS only")
+    for f in ev_s:
+        f.setdefault("match", "seismometer only")
+    for k, (i, j, _) in enumerate(sorted(pairs, key=lambda p: ev_d[p[0]]["t_on"]), 1):
+        ev_d[i]["id"] = ev_s[j]["id"] = f"C{k:02d}"
+    for ev, tag in ((ev_d, "D"), (ev_s, "S")):
+        k = 0
+        for e in ev:
+            if e["match"] != "common":
+                k += 1
+                e["id"] = f"{tag}{k:02d}"
+    return sorted(pairs, key=lambda p: ev_d[p[0]]["t_on"])
+
+
+def pair_metrics(T, e, f):
+    n = len(T["d"])
+    pad = int(round(0.5 * COMMON_FS_HZ))
+    a = max(0, min(e["on_i"], f["on_i"]) - pad)
+    b = min(n, max(e["off_i"], f["off_i"]) + pad)
+    d, s = T["d"][a:b], T["s"][a:b]
+    ok = np.isfinite(d) & np.isfinite(s)
+    out = dict(cc=np.nan, cc_lag=np.nan, polarity=1.0, c_app=np.nan, win=(a, b))
+    if ok.sum() < 10:
+        return out
+    d0, s0 = d[ok] - d[ok].mean(), s[ok] - s[ok].mean()
+    den = math.sqrt(float(np.sum(d0 ** 2) * np.sum(s0 ** 2)))
+    if den == 0:
+        return out
+    cc = correlate(d0, s0, mode="full") / den
+    lags = correlation_lags(len(d0), len(s0), mode="full")
+    m = np.abs(lags) <= int(round(CC_MAX_LAG_SEC * COMMON_FS_HZ))
+    k = int(np.argmax(np.abs(cc[m])))
+    out["cc"] = float(cc[m][k])
+    out["cc_lag"] = float(lags[m][k] / COMMON_FS_HZ)
+    out["polarity"] = 1.0 if out["cc"] >= 0 else -1.0
+    pd_, ps_ = float(np.max(np.abs(d0))), float(np.max(np.abs(s0)))
+    if pd_ > 0:
+        out["c_app"] = ps_ * T["s_si"] / (pd_ * T["d_si"])
+    return out
+
+
+def wilson(k, n, z=1.96):
+    if n == 0:
+        return np.nan, np.nan, np.nan
+    p = k / n
+    den = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / den
+    h = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / den
+    return p, max(0.0, c - h), min(1.0, c + h)
+
+
+def stats(ev_d, ev_s, pairs, metrics, hours):
+    n_d, n_s, n_c = len(ev_d), len(ev_s), len(pairs)
+    pd_, lo, hi = wilson(n_c, n_s)
+    pr, plo, phi = wilson(n_c, n_d)
+    lags = np.array([p[2] for p in pairs])
+    S = dict(n_d=n_d, n_s=n_s, n_c=n_c, n_d_only=n_d - n_c, n_s_only=n_s - n_c, pd=pd_, pd_ci=(lo, hi),
+             prec=pr, prec_ci=(plo, phi), far_per_h=(n_d - n_c) / hours if hours > 0 else np.nan)
+    S["pd_txt"] = f"{pd_:.2f} [{lo:.2f}–{hi:.2f}]" if n_s else "n/a"
+    S["prec_txt"] = f"{pr:.2f} [{plo:.2f}–{phi:.2f}]" if n_d else "n/a"
+    if len(lags):
+        S["lag_med"] = float(np.median(lags))
+        S["lag_iqr"] = (float(np.percentile(lags, 25)), float(np.percentile(lags, 75)))
+        S["lag_txt"] = f"{S['lag_med'] * 1000:+.0f} ms"
+    else:
+        S["lag_txt"] = "n/a"
+    cc = np.array([m["cc"] for m in metrics], float)
+    ca = np.array([m["c_app"] for m in metrics], float)
+    S["cc_med"] = float(np.nanmedian(np.abs(cc))) if np.isfinite(cc).any() else np.nan
+    S["c_app_med"] = float(np.nanmedian(ca)) if np.isfinite(ca).any() else np.nan
+    good = [m["cc_lag"] for m in metrics if np.isfinite(m["cc"]) and abs(m["cc"]) >= CC_MIN_FOR_CLOCK]
+    S["cc_lag_n"] = len(good)
+    S["cc_lag_med"] = float(np.median(good)) if good else np.nan
+    return S
+
+
+EPOCH_DAYS = float(mdates.date2num(np.datetime64("1970-01-01T00:00:00")))
+CATEGORY = {"common": ("common", COLOR_COMMON), "DAS only": ("DAS only", COLOR_DAS),
+            "seismometer only": ("seismometer only", COLOR_SEIS)}
+
+
+def tnum(t):
+    return np.asarray(t, np.float64) / 86400.0 + EPOCH_DAYS
+
+
+def plot_style():
+    plt.rcParams.update({
+        "font.family": "DejaVu Sans", "font.size": FONT_TICK, "axes.titlesize": FONT_SUBTITLE,
+        "axes.titleweight": "bold", "axes.labelsize": FONT_LABEL, "xtick.labelsize": FONT_TICK,
+        "ytick.labelsize": FONT_TICK, "legend.fontsize": FONT_LEGEND, "axes.linewidth": 1.0,
+        "xtick.major.width": 1.0, "ytick.major.width": 1.0, "xtick.major.size": 5, "ytick.major.size": 5,
+        "xtick.minor.visible": True, "ytick.minor.visible": True, "axes.spines.top": False,
+        "axes.spines.right": False, "axes.grid": True, "grid.linestyle": ":", "grid.linewidth": 0.6,
+        "grid.alpha": 0.6, "axes.axisbelow": True, "legend.frameon": False, "pdf.fonttype": 42,
+        "ps.fonttype": 42, "savefig.facecolor": "white", "agg.path.chunksize": 20000,
+        "axes.formatter.useoffset": False, "axes.formatter.limits": (-4, 5)})
+
+
+def new_figure(size):
+    try:
+        return plt.figure(figsize=size, layout="constrained")
+    except TypeError:
+        return plt.figure(figsize=size, constrained_layout=True)
+
+
+def save_figure(fig, base):
+    paths = []
+    for ext in FIG_FORMATS:
+        p = f"{base}.{ext}"
+        fig.savefig(p, dpi=DPI, facecolor="white", pil_kwargs={"quality": 95})
+        paths.append(p)
+    plt.close(fig)
+    return paths
+
+
+def draw_trace(ax, tn, x, color, label=None, lw=WAVE_LINEWIDTH, px=None, zorder=2):
+    n = len(x)
+    px = int(px or 3000)
+    k = n // (2 * px)
+    if k >= 2:
+        m = (n // k) * k
+        xb = np.asarray(x[:m], np.float64).reshape(-1, k)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            lo = np.nanmin(xb, axis=1)
+            hi = np.nanmax(xb, axis=1)
+        valid = np.isfinite(xb).any(axis=1)
+        lo[~valid] = np.nan
+        hi[~valid] = np.nan
+        t0 = np.asarray(tn[:m:k], np.float64)
+        t1 = np.asarray(tn[k - 1:m:k], np.float64)
+        tb = 0.5 * (t0 + t1)
+        ax.fill_between(tb, lo, hi, where=np.isfinite(lo) & np.isfinite(hi), color=color,
+                        lw=0.35, edgecolor=color, rasterized=True, label=label, zorder=zorder)
+        return tb, hi
+    y = np.ma.masked_invalid(x)
+    ax.plot(tn, y, color=color, lw=lw, rasterized=n > 20000, label=label, zorder=zorder)
+    return tn, np.asarray(y.filled(np.nan), np.float64)
+
+
+def time_axis(ax, label=True):
+    loc = mdates.AutoDateLocator(tz=UTC, minticks=6, maxticks=14)
+    ax.xaxis.set_major_locator(loc)
+    fmt = mdates.ConciseDateFormatter(loc, tz=UTC, show_offset=label)
+    fmt.formats = ["%Y", "%b", "%d", "%H:%M", "%H:%M", "%H:%M:%S"]
+    fmt.zero_formats = ["", "%Y", "%b", "%b-%d", "%H:%M", "%H:%M:%S"]
+    fmt.offset_formats = ["", "%Y", "%Y-%b", "%Y-%m-%d UTC", "%Y-%m-%d UTC", "%Y-%m-%d UTC"]
+    ax.xaxis.set_major_formatter(fmt)
+    ax.xaxis.set_minor_locator(mdates.AutoDateLocator(tz=UTC, minticks=30, maxticks=80))
+
+
+def shade_events(ax, ev, labels):
+    for e in ev:
+        c = CATEGORY[e["match"]][1]
+        ax.axvspan(tnum(e["t_on"]), tnum(e["t_off"]), color=c, alpha=0.07, lw=0, zorder=0)
+        ax.axvline(tnum(e["t_on"]), color=c, lw=0.7, ls=(0, (4, 3)), alpha=0.15, zorder=1)
+        ax.plot([tnum(e["t_on"])], [1.0], marker="v", ms=9, color=c, mec="white", mew=0.6, ls="none",
+                transform=ax.get_xaxis_transform(), clip_on=False, zorder=5)
+        if labels:
+            ax.annotate(e.get("id", ""), (tnum(e["t_on"]), 1.0), xycoords=ax.get_xaxis_transform(),
+                        xytext=(0, 8), textcoords="offset points", ha="center", va="bottom",
+                        fontsize=FONT_TICK - 2, color=c, fontweight="bold", annotation_clip=False)
+
+
+def fig_overview(T, R_d, R_s, ev_d, ev_s, info, base, equivalent=False):
+    n = len(T["d"])
+    if not (len(T["s"]) == len(R_d) == len(R_s) == n):
+        raise StopRun("DAS, seismic and STA/LTA arrays must have the same time-grid length")
+    tn = tnum(info["t_a"] + np.arange(n) / COMMON_FS_HZ)
+    das_valid = np.isfinite(T["d"])
+    seis_valid = np.isfinite(T["s"])
+    fig = new_figure(FIGSIZE)
+    gs = fig.add_gridspec(5, 1, height_ratios=[1.05, 1.0, 0.62, 1.0, 0.62])
+    hdr = fig.add_subplot(gs[0])
+    hdr.axis("off")
+    axes = [fig.add_subplot(gs[1])]
+    for i in range(2, 5):
+        axes.append(fig.add_subplot(gs[i], sharex=axes[0]))
+    px = FIGSIZE[0] * DPI * 0.9
+    labels = (len(ev_d) + len(ev_s)) <= LABEL_EVENTS_MAX
+    band = T["band"]
+
+    shared_lim = None
+    if equivalent:
+        finite = np.r_[np.abs(np.asarray(T["d"])[np.isfinite(T["d"])]),
+                       np.abs(np.asarray(T["s"])[np.isfinite(T["s"])])]
+        shared_lim = (max(1e-10, float(np.percentile(finite, WAVE_CLIP_PERCENTILE)) * 1.08) if finite.size else 1.0) / 2.0
+
+    def mark_unavailable(ax, valid):
+        missing = ~valid
+        if not np.any(missing):
+            return
+        edges = np.flatnonzero(np.diff(np.r_[0, missing.astype(np.int8), 0]))
+        for a, b in zip(edges[::2], edges[1::2]):
+            if (b - a) / COMMON_FS_HZ >= 1.0:
+                ax.axvspan(tnum(info["t_a"] + a / COMMON_FS_HZ),
+                           tnum(info["t_a"] + b / COMMON_FS_HZ),
+                           color="0.6", alpha=0.12, lw=0, zorder=-2)
+
+    def wave(ax, x, color, ev, ylab, half_original_seismic=False):
+        draw_trace(ax, tn, x, color, px=px)
+        fin = np.abs(x[np.isfinite(x)])
+        lim = shared_lim if shared_lim is not None else (
+            max(1e-12, float(np.percentile(fin, WAVE_CLIP_PERCENTILE)) * 1.08) if fin.size else 1.0)
+        if half_original_seismic and not equivalent:
+            lim /= 2.0
+        ax.set_ylim(-lim, lim)
+        ax.set_ylabel(ylab)
+        shade_events(ax, ev, labels)
+
+    def stalta(ax, r, color, ev):
+        tb, hi = draw_trace(ax, tn, r, color, lw=0.9, px=px)
+        ax.fill_between(tb, TRIGGER_ON, hi, where=hi >= TRIGGER_ON, color=color, alpha=0.35,
+                        lw=0, interpolate=True, rasterized=True)
+        ax.axhline(TRIGGER_ON, color="black", lw=1.0, ls="--", alpha=0.35, zorder=4)
+        ax.axhline(TRIGGER_OFF, color=COLOR_OFF, lw=1.0, ls="-.", alpha=0.35, zorder=4)
+        top = max(TRIGGER_ON * 2.0, float(np.nanmax(r)) * 1.12 if np.isfinite(r).any() else 0)
+        ax.set_ylim(0, top)
+        ax.set_ylabel("STA/LTA")
+        shade_events(ax, ev, False)
+
+    dist = f" ({info['ref_dist']:.1f} m)" if np.isfinite(info.get("ref_dist", np.nan)) else ""
+    wave(axes[0], T["d"], COLOR_DAS, ev_d, f"{T['d_name'].capitalize()}\n({T['d_unit']})")
+    stalta(axes[1], np.where(das_valid, R_d, np.nan), COLOR_DAS, ev_d)
+    wave(axes[2], T["s"], COLOR_SEIS, ev_s, f"{T['s_name'].capitalize()}\n({T['s_unit']})",
+         half_original_seismic=True)
+    stalta(axes[3], np.where(seis_valid, R_s, np.nan), COLOR_SEIS, ev_s)
+    for ax, valid in zip(axes, (das_valid, das_valid, seis_valid, seis_valid)):
+        mark_unavailable(ax, valid)
+    if das_valid.any() and not das_valid[0]:
+        first_d = int(np.flatnonzero(das_valid)[0])
+        axes[0].text(0.003, 0.035, f"Initial DAS data gap: {first_d / COMMON_FS_HZ:.1f} s",
+                     transform=axes[0].transAxes, fontsize=max(8.0, FONT_TICK - 3),
+                     color="0.40", va="bottom", ha="left",
+                     bbox=dict(facecolor="white", edgecolor="none", alpha=0.8, pad=1.4))
+
+    titles = [f"(a) {info['das_name']} ch {info['ref']}{dist} — {T['d_name']}, {band[0]:g}–{band[1]:g} Hz, "
+              f"{len(ev_d)} events",
+              "(b) DAS STA/LTA — detections from the original strain-rate trace",
+              f"(c) Seismometer {info['sid']}, {T['comp']} {T['s_name']}, {band[0]:g}–{band[1]:g} Hz, "
+              f"{len(ev_s)} events",
+              "(d) Seismometer STA/LTA (same detection parameters)"]
+    for ax, ttl in zip(axes, titles):
+        ax.set_title(ttl, loc="left", pad=18 if labels else 10)
+        time_axis(ax, label=ax is axes[-1])
+        ax.tick_params(labelbottom=ax is axes[-1])
+        ax.margins(x=0)
+    axes[-1].set_xlabel("Time (UTC)")
+    axes[0].set_xlim(tnum(info["t_a"]), tnum(info["t_b"]))
+
+    S = info["stats"]
+    mode = "Acceleration" if equivalent else "Measurements"
+    hdr.text(0.0, 0.99,
+             f"STA/LTA event detection | {mode} | {info['das_name']} CH {info['ref']} vs {info['sid']}",
+             fontsize=FONT_TITLE, fontweight="bold", va="top", ha="left", transform=hdr.transAxes)
+    hdr.text(0.0, 0.80,
+             f"{utc_text(info['t_a'])} – {utc_text(info['t_b'])} UTC  |  {band[0]:g}–{band[1]:g} Hz  |  "
+             f"STA {STA_SEC:g} s, LTA {LTA_SEC:g} s, on {TRIGGER_ON:g}, off {TRIGGER_OFF:g}, match ±{MATCH_TOL_SEC:g} s",
+             fontsize=FONT_SUBTITLE, va="top", transform=hdr.transAxes)
+    hdr.text(0.0, 0.63,
+             f"DAS {S['n_d']} events, seismometer {S['n_s']}, common {S['n_c']}  |  "
+             f"P_D = {S['pd_txt']}  |  precision = {S['prec_txt']}\n"
+             f"onset lag DAS − seis: {S['lag_txt']}",
+             fontsize=FONT_SUBTITLE, va="top", transform=hdr.transAxes)
+    if equivalent:
+        caveat = "" if "no fibre azimuth" in T["comp"] else "Fiber-axial proxy; assumes one-dimensional traveling waves"
+        hdr.text(0.0, 0.32,
+                 f"DAS estimate: a = c_app × strain rate; c_app ≈ {FK_APPARENT_VELOCITY_MPS:g} m/s from f–k ",
+                 fontsize=FONT_TICK, va="top", transform=hdr.transAxes)
+    handles = [Patch(fc=COLOR_COMMON, alpha=0.5, label=f"common ({S['n_c']})"),
+               Patch(fc=COLOR_DAS, alpha=0.5, label=f"DAS only ({S['n_d_only']})"),
+               Patch(fc=COLOR_SEIS, alpha=0.5, label=f"seismometer only ({S['n_s_only']})"),
+               Line2D([], [], color="black", ls="--", lw=1.3, label=f"trigger on {TRIGGER_ON:g}"),
+               Line2D([], [], color=COLOR_OFF, ls="-.", lw=1.3, label=f"detrigger off {TRIGGER_OFF:g}")]
+    hdr.legend(handles=handles, loc="lower left", bbox_to_anchor=(0.0, 0.03), ncol=5,
+               handlelength=2.2, columnspacing=1.8, borderaxespad=0.0)
+    return save_figure(fig, base)
+
+
+def fig_gallery(T, ev_d, ev_s, pairs, metrics, info, base, equivalent=False):
+    if not pairs:
+        return []
+    order = sorted(range(len(pairs)), key=lambda k: -np.nan_to_num(ev_d[pairs[k][0]]["snr_excess_db"], nan=-99))
+    order = sorted(order[:GALLERY_MAX])
+    ncol = min(GALLERY_NCOLS, len(order))
+    nrow = int(math.ceil(len(order) / ncol))
+    fig = new_figure((5.6 * ncol + 0.6, 3.0 * nrow + 1.8))
+    gs = fig.add_gridspec(nrow, ncol)
+    longest = max(max(ev_d[pairs[k][0]]["dur"], ev_s[pairs[k][1]]["dur"]) for k in order)
+    post_sec = float(min(GALLERY_POST_SEC, max(3.0, math.ceil(1.6 * longest + 1.0))))
+    pre_sec = float(min(GALLERY_PRE_SEC, max(1.0, 0.4 * post_sec)))
+    pre, post = int(pre_sec * COMMON_FS_HZ), int(post_sec * COMMON_FS_HZ)
+    n = len(T["d"])
+    for p, k in enumerate(order):
+        i, j, dt = pairs[k]
+        e, f, m = ev_d[i], ev_s[j], metrics[k]
+        ax = fig.add_subplot(gs[p // ncol, p % ncol])
+        a, b = max(0, e["on_i"] - pre), min(n, e["on_i"] + post)
+        tt = (np.arange(a, b) - e["on_i"]) / COMMON_FS_HZ
+        d, s = T["d"][a:b], T["s"][a:b]
+        nd = float(np.nanmax(np.abs(d))) if np.isfinite(d).any() else 0.0
+        ns = float(np.nanmax(np.abs(s))) if np.isfinite(s).any() else 0.0
+        if equivalent:
+            ax.plot(tt, d, color=COLOR_DAS, lw=1.0, label=f"DAS est. (peak {nd:.3g} mm/s²)")
+            ax.plot(tt, s, color=COLOR_SEIS, lw=1.0, alpha=0.85,
+                    label=f"seis (peak {ns:.3g} mm/s²)")
+            lim = max(1e-9, nd, ns) * 1.1
+            ax.set_ylim(-lim, lim)
+        else:
+            ax.plot(tt, d / (nd if nd > 0 else 1.0), color=COLOR_DAS, lw=1.0,
+                    label=f"DAS (peak {nd:.3g} {T['d_unit']})")
+            ax.plot(tt, s * m["polarity"] / (ns if ns > 0 else 1.0), color=COLOR_SEIS, lw=1.0, alpha=0.85,
+                    label=f"seis{' ×(−1)' if m['polarity'] < 0 else ''} (peak {ns:.3g} {T['s_unit']})")
+            ax.set_ylim(-1.5, 1.5)
+        ax.axvline(0, color=COLOR_DAS, lw=1.0, ls="--", alpha=0.25)
+        ax.axvline(f["t_on"] - e["t_on"], color=COLOR_SEIS, lw=1.0, ls=":", alpha=0.25)
+        ax.set_xlim(-pre_sec, post_sec)
+        ax.set_title(f"{e['id']}  {utc_text(e['t_on'], '%H:%M:%S')}.{int(round(e['t_on'] % 1 * 1000)) % 1000:03d}",
+                     loc="left", fontsize=FONT_LABEL)
+        ax.text(0.99, 0.03,
+                f"onset Δt {dt * 1000:+.0f} ms   CC {m['cc']:+.2f} at {m['cc_lag'] * 1000:+.0f} ms",
+                transform=ax.transAxes, ha="right", va="bottom", fontsize=FONT_TICK - 1,
+                bbox=dict(fc="white", ec="0.8", lw=0.6, alpha=0.9, pad=2.5))
+        ax.legend(loc="upper right", fontsize=FONT_TICK - 2, handlelength=1.4)
+        if p // ncol == nrow - 1 or p + ncol >= len(order):
+            ax.set_xlabel("Time after DAS onset (s)")
+        if p % ncol == 0:
+            ax.set_ylabel("Acceleration (mm/s²)" if equivalent else "Normalised")
+    more = f" " if len(pairs) > len(order) else ""
+    title = (f"Common events{more} | {info['das_name']} ch {info['ref']} vs "
+             f"{info['sid']} | {utc_text(info['t_a'])}–{utc_text(info['t_b'], '%H:%M:%S')} UTC")
+    if equivalent:
+        subtitle = (f"Acceleration (mm/s²), {T['band'][0]:g}–{T['band'][1]:g} Hz | "
+                    f"DAS: c_app ≈ {FK_APPARENT_VELOCITY_MPS:g} m/s from f–k")
+        detail = "Dashed: DAS onset; dotted: seismic onset"
+    else:
+        subtitle = (f"DAS {T['d_name']} ({T['d_unit']}) vs seismic {T['s_name']} ({T['s_unit']}), "
+                    f"{T['band'][0]:g}–{T['band'][1]:g} Hz")
+        detail = "Individually normalised, seismic polarity adjusted by CC | Dashed: DAS onset; dotted: seismic onset"
+    fig.suptitle(title + "\n" + subtitle + "\n" + detail,
+                 fontsize=FONT_TICK + 5, fontweight="bold")
+    return save_figure(fig, base)
+
+
+def fig_summary(T, ev_d, ev_s, pairs, metrics, info, base):
+    S = info["stats"]
+    fig = new_figure((18.0, 5.6))
+    ax1, ax2, ax3 = fig.subplots(1, 3, gridspec_kw=dict(width_ratios=[0.8, 1.0, 1.0]))
+    names = ["DAS", "seismometer", "common", "DAS only", "seis only"]
+    vals = [S["n_d"], S["n_s"], S["n_c"], S["n_d_only"], S["n_s_only"]]
+    cols = [COLOR_DAS, COLOR_SEIS, COLOR_COMMON, COLOR_DAS, COLOR_SEIS]
+    bars = ax1.bar(names, vals, color=cols, alpha=0.85, edgecolor="black", lw=0.6)
+    for bar_ in bars[3:]:
+        bar_.set_hatch("//")
+    ax1.bar_label(bars, padding=3, fontsize=FONT_TICK)
+    ax1.set_ylabel("Number of events")
+    ax1.set_title("(a) Event counts", loc="left")
+    ax1.text(0.98, 0.97, f"P_D = {S['pd_txt']}\nprecision = {S['prec_txt']}", transform=ax1.transAxes,
+             ha="right", va="top", fontsize=FONT_TICK, bbox=dict(fc="white", ec="0.8", lw=0.6, pad=3))
+    ax1.tick_params(axis="x", rotation=20, which="both", bottom=False)
+    ax1.set_ylim(0, max(vals + [1]) * 1.5)
+    ax1.grid(axis="x", visible=False)
+    lags = np.array([p[2] for p in pairs]) * 1000
+    if len(lags):
+        w = max(5.0, 1000.0 / COMMON_FS_HZ)
+        lo_, hi_ = math.floor(lags.min() / w) * w - w, math.ceil(lags.max() / w) * w + w
+        cl = np.array([m["cc_lag"] for m in metrics], float) * 1000
+        cl = cl[np.isfinite(cl)]
+        if cl.size:
+            lo_, hi_ = min(lo_, math.floor(cl.min() / w) * w - w), max(hi_, math.ceil(cl.max() / w) * w + w)
+        bins = np.arange(lo_, hi_ + w, w)
+        ax2.hist(lags, bins=bins, color=COLOR_COMMON, alpha=0.85, edgecolor="black", lw=0.6, label="STA/LTA onsets")
+        if cl.size:
+            ax2.hist(cl, bins=bins, histtype="step", color="black", lw=1.8, label="waveform CC")
+        ax2.axvline(np.median(lags), color=COLOR_COMMON, lw=1.8, ls="--", label=f"median onset {np.median(lags):+.0f} ms")
+        if np.isfinite(S["cc_lag_med"]):
+            ax2.axvline(S["cc_lag_med"] * 1000, color="black", lw=1.5, ls=":",
+                        label=f"median CC {S['cc_lag_med'] * 1000:+.0f} ms")
+        ax2.axvline(0, color="0.5", lw=1.0)
+        ax2.legend(loc="upper right")
+    else:
+        ax2.text(0.5, 0.5, "no common events", ha="center", va="center", transform=ax2.transAxes)
+    ax2.set_xlabel("Lag DAS − seismometer (ms)")
+    ax2.set_ylabel("Count")
+    ax2.set_title("(b) Time lag of common events", loc="left")
+    if pairs:
+        xs = np.array([np.nanmax(np.abs(T["s"][m["win"][0]:m["win"][1]])) for m in metrics])
+        ys = np.array([np.nanmax(np.abs(T["d"][m["win"][0]:m["win"][1]])) for m in metrics])
+        cc = np.abs([m["cc"] for m in metrics])
+        sc = ax3.scatter(xs, ys, c=cc, cmap="viridis", vmin=0, vmax=1, s=70, edgecolor="black", lw=0.6, zorder=3)
+        cb = fig.colorbar(sc, ax=ax3, pad=0.01)
+        cb.set_label("|CC|")
+        import matplotlib.ticker as mticker
+        ax3.set_xscale("log")
+        ax3.set_yscale("log")
+        x0, x1 = xs.min() / 3, xs.max() * 3
+        y0, y1 = ys.min() / 3, ys.max() * 3
+        ax3.set_xlim(x0, x1)
+        ax3.set_ylim(y0, y1)
+        for c in (100, 300, 1000, 3000, 10000):
+            k_ = T["s_si"] / (c * T["d_si"])
+            ax3.plot([x0, x1], [x0 * k_, x1 * k_], color="0.6", lw=0.9, ls="--", zorder=1)
+            xl = min(x1, y1 / k_) / 1.35
+            if xl * k_ > y0 and xl > x0:
+                ax3.text(xl, xl * k_, f"{c:g} m/s", rotation=0, ha="right", va="bottom",
+                         fontsize=FONT_TICK - 2, color="0.35", bbox=dict(fc="white", ec="none", pad=0.5, alpha=0.8))
+        for axis in (ax3.xaxis, ax3.yaxis):
+            axis.set_major_locator(mticker.LogLocator(base=10, subs=(1.0, 2.0, 5.0)))
+            axis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v:g}"))
+            axis.set_minor_formatter(mticker.NullFormatter())
+        for k, (i, j, _) in enumerate(pairs):
+            if len(pairs) <= LABEL_EVENTS_MAX:
+                ax3.annotate(ev_d[i]["id"], (xs[k], ys[k]), xytext=(5, 4), textcoords="offset points",
+                             fontsize=FONT_TICK - 3)
+        med = f", median c ≈ {S['c_app_med']:.0f} m/s" if np.isfinite(S["c_app_med"]) else ""
+        ax3.set_title(f"(c) Peak amplitudes{med}", loc="left")
+    else:
+        ax3.text(0.5, 0.5, "no common events", ha="center", va="center", transform=ax3.transAxes)
+        ax3.set_title("(c) Peak amplitudes", loc="left")
+    ax3.set_xlabel(f"Seismometer peak {T['s_name']} ({T['s_unit']})")
+    ax3.set_ylabel(f"DAS peak {T['d_name']} ({T['d_unit']})")
+    fig.suptitle(f"Detection summary — {info['das_name']} ch {info['ref']} vs {info['sid']}, "
+                 f"{utc_text(info['t_a'])} – {utc_text(info['t_b'], '%H:%M:%S')} UTC",
+                 fontsize=FONT_SUBTITLE + 2, fontweight="bold")
+    return save_figure(fig, base)
+
+
+def utc_ms(t):
+    t = round(float(t), 3)
+    return f"{utc_text(math.floor(t))}.{int(round((t - math.floor(t)) * 1000)) % 1000:03d}"
+
+
+def report(ev_d, ev_s, pairs, metrics, S, T, info):
+    L = ["STA/LTA event detection report", ""]
+    L.append(f"window          : {utc_text(info['t_a'])} – {utc_text(info['t_b'])} UTC")
+    L.append(f"DAS             : {info['das_desc']}")
+    L.append(f"                  ch {info['ref']} ({info['ref_dist']:.1f} m), {T['d_name']} ({T['d_unit']})")
+    L.append(f"seismometer     : {info['sid']} {T['comp']}, {T['s_name']} ({T['s_unit']}), "
+             f"time shift applied {SEIS_TIME_SHIFT_SEC:+g} s")
+    L.append(f"band            : {T['band'][0]:g}–{T['band'][1]:g} Hz, {COMMON_FS_HZ:g} Hz sampling")
+    L.append(f"STA/LTA         : STA {STA_SEC:g} s, LTA {LTA_SEC:g} s, trigger on {TRIGGER_ON:g}, off {TRIGGER_OFF:g}, "
+             f"min duration {MIN_EVENT_SEC:g} s, declustering {DECLUSTER_SEC:g} s")
+    L.append(f"matching        : onsets within ±{MATCH_TOL_SEC:g} s")
+    L.append(f"coverage        : DAS {100 * info['cov_d']:.1f} %, seismometer {100 * info['cov_s']:.1f} %")
+    L.append("")
+    L.append(f"DAS events               : {S['n_d']}")
+    L.append(f"seismometer events       : {S['n_s']}")
+    L.append(f"common (TP)              : {S['n_c']}")
+    L.append(f"DAS only (FP vs seis)    : {S['n_d_only']}  ({S['far_per_h']:.2f} per hour)")
+    L.append(f"seismometer only (FN)    : {S['n_s_only']}")
+    L.append(f"P_D = TP/(TP+FN)         : {S['pd_txt']}  (Wilson 95 %)")
+    L.append(f"precision = TP/(TP+FP)   : {S['prec_txt']}  (Wilson 95 %)")
+    if "lag_med" in S:
+        L.append("onset lag DAS − seis")
+        L.append(f"    median: {S['lag_med'] * 1000:+.0f} ms, IQR "
+                 f"{S['lag_iqr'][0] * 1000:+.0f} to "
+                 f"{S['lag_iqr'][1] * 1000:+.0f} ms over {len(pairs)} pairs")
+    if np.isfinite(S["cc_med"]):
+        L.append(f"waveform |CC|            : median {S['cc_med']:.2f} "
+                 f"(DAS {T['d_name']} vs seis {T['s_name']})")
+    if S["cc_lag_n"]:
+        L.append(f"time offset from CC      : median {S['cc_lag_med'] * 1000:+.0f} ms "
+                 f"(DAS − seis) over {S['cc_lag_n']} events "
+                 f"with |CC| ≥ {CC_MIN_FOR_CLOCK:g}")
+    if np.isfinite(S["c_app_med"]):
+        L.append(f"peak amplitude ratio    : median {S['c_app_med']:.0f} m/s")
+        L.append("    (peak seismic acceleration divided by peak DAS strain rate; "
+                 "NOT an independent wave velocity estimate)")
+    L.append("")
+    L.append(f"f-k velocity reference      : {FK_APPARENT_VELOCITY_MPS:g} m/s (assumed constant for plots)")
+    L.append(f"f-k indicative range       : {FK_VELOCITY_RANGE_MPS[0]:g}–{FK_VELOCITY_RANGE_MPS[1]:g} m/s")
+    L.append(f"f-k reference              : {FK_VELOCITY_SOURCE}")
+    L.append("DAS estimated acceleration : a[mm/s^2] = c_app[m/s] × DAS_strain_rate[nstrain/s] × 1e-6")
+    L.append("Interpretation             : one-dimensional wave proxy, not directly measured acceleration; "
+             "geometry, coupling, dispersion and 3D wave motion can change the amplitudes")
+    L.append("")
+    L.append("common events")
+    L.append("  ID   DAS onset (UTC)          seis onset (UTC)          lag (ms)  STA/LTA DAS  seis   "
+             "SNRexc DAS   seis      CC   CC lag (ms)  c (m/s)")
+    for (i, j, dt), m in zip(pairs, metrics):
+        e, f = ev_d[i], ev_s[j]
+        L.append(f"  {e['id']}  {utc_ms(e['t_on'])}  {utc_ms(f['t_on'])}  {dt * 1000:+8.0f}  {e['peak_ratio']:11.1f}  "
+                 f"{f['peak_ratio']:5.1f}  {e['snr_excess_db']:7.1f} dB {f['snr_excess_db']:5.1f} dB  "
+                 f"{m['cc']:+5.2f}  {m['cc_lag'] * 1000:+10.0f}  {m['c_app']:7.0f}")
+    probs = []
+    if S["n_s"] == 0:
+        probs.append("no seismometer events: P_D cannot be evaluated (lower TRIGGER_ON or check the window)")
+    if S["n_d"] == 0:
+        probs.append("no DAS events: check the DAS data or lower TRIGGER_ON")
+    tol = max(0.02, 2.0 / COMMON_FS_HZ)
+    if S["cc_lag_n"] >= 3 and abs(S["cc_lag_med"]) > tol:
+        probs.append(f"waveform cross-correlation gives a time offset of {S['cc_lag_med'] * 1000:+.0f} ms "
+                     f"(DAS − seis, {S['cc_lag_n']} events): set SEIS_TIME_SHIFT_SEC = "
+                     f"{SEIS_TIME_SHIFT_SEC + S['cc_lag_med']:+.3f} to align the instruments")
+    elif S["cc_lag_n"] < 3 and "lag_med" in S and abs(S["lag_med"]) > 0.2:
+        probs.append(f"median onset lag {S['lag_med'] * 1000:+.0f} ms: consistent with a clock offset; "
+                     f"set SEIS_TIME_SHIFT_SEC = {SEIS_TIME_SHIFT_SEC + S['lag_med']:+.3f} to align the instruments "
+                     f"(onset lags are biased towards the later-triggering sensor; too few well-correlated events "
+                     f"for a cross-correlation estimate)")
+    if info["cov_d"] < 0.95 or info["cov_s"] < 0.95:
+        probs.append("data gaps in the window (STA/LTA is set to 0 for one LTA length after each gap)")
+    if T["band"][1] < BAND_HZ[1]:
+        probs.append(f"band capped at {T['band'][1]:g} Hz by the sampling rate (BAND_HZ = {BAND_HZ[1]:g} Hz)")
+    if info.get("orientation_note"):
+        probs.append(info["orientation_note"])
+    L.append("")
+    L.append("status: " + ("OK" if not probs else f"{len(probs)} point(s) to check"))
+    for p in probs:
+        L.append(f"  - {p}")
+    return "\n".join(L)
+
+
+def write_events_csv(path, ev_d, ev_s, T):
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("id,sensor,onset_utc,offset_utc,duration_s,match,peak_sta_lta,peak_amplitude,unit,snr_total,"
+                 "snr_excess_db\n")
+        rows = [("DAS", e, T["d_unit"]) for e in ev_d] + [("seismometer", e, T["s_unit"]) for e in ev_s]
+        for name, e, unit in sorted(rows, key=lambda r: r[1]["t_on"]):
+            fh.write(f"{e['id']},{name},{utc_ms(e['t_on'])},{utc_ms(e['t_off'])},{e['dur']:.3f},{e['match']},"
+                     f"{e['peak_ratio']:.3f},{e['peak_amp']:.6g},{unit},{e['snr_total']:.4g},"
+                     f"{e['snr_excess_db']:.2f}\n")
+
+
+def next_number(folder, prefix):
+    n = 0
+    for p in glob.glob(os.path.join(folder, f"{prefix}_*")):
+        m = re.fullmatch(re.escape(prefix) + r"_(\d{3,})(?:_[a-z0-9]+)*\.(?:png|pdf|svg|jpe?g|csv|txt)",
+                         os.path.basename(p))
+        if m:
+            n = max(n, int(m.group(1)))
+    return f"{n + 1:03d}"
+
+
+def main(argv=None):
+    global START_TIME, END_TIME, DAS_REF_CHANNEL, DAS_REF_DISTANCE_M, TRIGGER_ON, TRIGGER_OFF, STA_SEC, \
+        LTA_SEC, SEIS_TIME_SHIFT_SEC, DAS_FOLDER, OUTPUT_FOLDER, FK_APPARENT_VELOCITY_MPS
+    ap = argparse.ArgumentParser(description="STA/LTA event detection: DAS (Febus/Sintela) vs seismometer")
+    ap.add_argument("--start")
+    ap.add_argument("--end")
+    ap.add_argument("--ref-channel", type=int)
+    ap.add_argument("--ref-distance", type=float, help="optical distance (m) instead of a channel index")
+    ap.add_argument("--das-folder")
+    ap.add_argument("--output")
+    ap.add_argument("--on", type=float)
+    ap.add_argument("--off", type=float)
+    ap.add_argument("--sta", type=float)
+    ap.add_argument("--lta", type=float)
+    ap.add_argument("--seis-shift", type=float)
+    ap.add_argument("--fk-velocity", type=float, help="assumed f-k apparent velocity (m/s) used to estimate DAS acceleration")
+    a = ap.parse_args(argv)
+    START_TIME = a.start or START_TIME
+    END_TIME = a.end or END_TIME
+    DAS_REF_CHANNEL = a.ref_channel if a.ref_channel is not None else DAS_REF_CHANNEL
+    DAS_REF_DISTANCE_M = a.ref_distance if a.ref_distance is not None else DAS_REF_DISTANCE_M
+    DAS_FOLDER = a.das_folder or DAS_FOLDER
+    OUTPUT_FOLDER = a.output or OUTPUT_FOLDER
+    TRIGGER_ON = a.on or TRIGGER_ON
+    TRIGGER_OFF = a.off or TRIGGER_OFF
+    STA_SEC = a.sta or STA_SEC
+    LTA_SEC = a.lta or LTA_SEC
+    SEIS_TIME_SHIFT_SEC = a.seis_shift if a.seis_shift is not None else SEIS_TIME_SHIFT_SEC
+    FK_APPARENT_VELOCITY_MPS = a.fk_velocity if a.fk_velocity is not None else FK_APPARENT_VELOCITY_MPS
+    if TRIGGER_OFF >= TRIGGER_ON:
+        raise StopRun("TRIGGER_OFF must be lower than TRIGGER_ON")
+
+    win = configured_window()
+    log(f"\nSTA/LTA: DAS {'distance ' + format(DAS_REF_DISTANCE_M, 'g') + ' m' if DAS_REF_DISTANCE_M is not None else 'ch ' + str(DAS_REF_CHANNEL)}"
+        f" vs {SEIS_STATION}, window " + ("auto" if win is None else f"{utc_text(win[0])} - {utc_text(win[1])} UTC"))
+    log("\nseismometer")
+    inv = load_inventory()
+    sel = scan_seismic(win)
+    log("\ntime window")
+    t_a, t_b = choose_window(sel, win)
+    log("\nseismometer data")
+    import contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        enz, sid, coords_xml, comp_info = load_seismic(t_a, t_b, inv, sel)
+    text = buf.getvalue()
+    print(text, end="")
+    orientation_note = ("seismometer orientation from the SEED channel convention (StationXML azimuth/dip are "
+                        "placeholders)") if "placeholders" in text else None
+    log("\nDAS")
+    das, L0, ref = load_das(t_a, t_b)
+    log("\nfibre geometry")
+    coords, coord_src = station_location(coords_xml)
+    geo = fibre_geometry(np.array([ref]), L0["dx"], coords, coord_src)
+
+    log("\nSTA/LTA")
+    raw_first = np.flatnonzero(np.isfinite(das[:, 0]))
+    if len(raw_first):
+        log(f"  DAS input first valid sample: {utc_text(t_a + raw_first[0] / COMMON_FS_HZ)} UTC "
+            f"({raw_first[0] / COMMON_FS_HZ:.3f} s after window start)")
+    band = effective_band([L0["fs"], sel.get("fs")])
+    T = prepare_traces(das, enz, geo, 0, band)
+    first_d = np.flatnonzero(np.isfinite(T["d"]))
+    first_s = np.flatnonzero(np.isfinite(T["s"]))
+    if len(first_d):
+        log(f"  DAS first valid plotted sample: {utc_text(t_a + first_d[0] / COMMON_FS_HZ)} UTC "
+            f"({first_d[0] / COMMON_FS_HZ:.3f} s after window start)")
+    if len(first_s):
+        log(f"  seismic first valid plotted sample: {utc_text(t_a + first_s[0] / COMMON_FS_HZ)} UTC "
+            f"({first_s[0] / COMMON_FS_HZ:.3f} s after window start)")
+    T_acc = make_equivalent_acceleration(T)
+    log(f"  estimated DAS acceleration: c_app = {FK_APPARENT_VELOCITY_MPS:g} m/s from the displayed f-k ridge")
+    log(f"  indicative tracked ridge range: {FK_VELOCITY_RANGE_MPS[0]:g}-{FK_VELOCITY_RANGE_MPS[1]:g} m/s")
+    if "no fibre azimuth" in T["comp"]:
+        log("  ! seismic E component is not a verified fibre-axial projection: amplitudes are illustrative only")
+    R_d, R_s = sta_lta(T["d"]), sta_lta(T["s"])
+    ev_d, ev_s = detect(R_d, T["d"], t_a), detect(R_s, T["s"], t_a)
+    pairs = match(ev_d, ev_s)
+    metrics = [pair_metrics(T, ev_d[i], ev_s[j]) for i, j, _ in pairs]
+    S = stats(ev_d, ev_s, pairs, metrics, (t_b - t_a) / 3600.0)
+    das_name = {"febus": "Febus DAS", "sintela": "Sintela DAS"}[L0["format"]]
+    das_desc = f"{das_name}, {os.path.basename(L0['path'])}"
+    if L0["format"] == "febus":
+        das_desc += f" ({L0['febus']['zone'].strip('/')}/{L0['dataset'].rsplit('/', 1)[-1]})"
+    das_desc += f", {L0['fs']:g} Hz, GL {L0['gauge']} m, dx {L0['dx']:.4g} m"
+    info = dict(t_a=t_a, t_b=t_b, ref=ref, ref_dist=L0["dist0"] + ref * L0["dx"], sid=sid, stats=S,
+                orientation_note=orientation_note, das_name=das_name, das_desc=das_desc,
+                cov_d=float(np.isfinite(T["d"]).mean()), cov_s=float(np.isfinite(T["s"]).mean()))
+
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    prefix = (f"STALTA_{L0['format'].capitalize()}_{SEIS_STATION}_ch{ref}_{utc_text(t_a, '%Y%m%d_%H%M%S')}_"
+              f"{int(round((t_b - t_a) / 60))}min")
+    num = next_number(OUTPUT_FOLDER, prefix)
+    base = os.path.join(OUTPUT_FOLDER, f"{prefix}_{num}")
+    log("\nfigures")
+    plot_style()
+    figs = fig_gallery(T, ev_d, ev_s, pairs, metrics, info, base + "_gallery_original")
+    figs += fig_overview(T, R_d, R_s, ev_d, ev_s, info, base + "_overview_original")
+    figs += fig_gallery(T_acc, ev_d, ev_s, pairs, metrics, info, base + "_gallery_mmps2", equivalent=True)
+    figs += fig_overview(T_acc, R_d, R_s, ev_d, ev_s, info, base + "_overview_mmps2", equivalent=True)
+    rep = report(ev_d, ev_s, pairs, metrics, S, T, info)
+    rpt = base + "_report.txt"
+    with open(rpt, "w", encoding="utf-8") as fh:
+        fh.write(rep + "\n")
+    csv = base + "_events.csv"
+    write_events_csv(csv, ev_d, ev_s, T)
+    log("\n" + rep)
+    log("\nsaved:\n" + "\n".join(f"  {p}" for p in figs + [rpt, csv]))
+    return dict(ev_d=ev_d, ev_s=ev_s, pairs=pairs, metrics=metrics, stats=S, T=T, T_acc=T_acc,
+                R_d=R_d, R_s=R_s, info=info, figures=figs, report=rpt, csv=csv, layout=L0)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except StopRun as e:
+        log(f"\nSTOP: {e}")
+        raise SystemExit(1)
